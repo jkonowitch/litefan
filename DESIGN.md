@@ -310,18 +310,3 @@ claim/ack batch sizes (`1, 10, 100, 1_000`), and a large inactive backlog. Those
 measurements tell us whether Shape C's extra state machine is justified. Add
 retention, replay, richer filters, and dead-letter policy only after the core
 semantics feel right.
-
-### Initial spike result
-
-The first implementation uses set-based inserts for unkeyed publish batches.
-On the development machine, a release-mode smoke test produced roughly:
-
-- 220k messages/s when publishing 1,000 messages to one consumer;
-- 1.4-1.5M delivery-row inserts/s at 100 and 1,000 consumers;
-- 325k claim-and-ack messages/s with batches of 500;
-- 44k new keyed messages/s and 105k duplicate keyed no-ops/s;
-- 820k messages/s while building a 100,000-row inactive backlog.
-
-These are directional rather than promises; storage, SQLite build, durability
-settings, payload size, and hardware all matter. They are sufficient to keep
-Shape A as v1. The included `examples/benchmark.rs` reproduces the smoke test.

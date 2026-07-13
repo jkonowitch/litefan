@@ -1,6 +1,7 @@
 //! Informational performance smoke test for the initial materialized-inbox design.
 //!
 //! Run with: `cargo run --release --example benchmark`
+//! Results and interpretation live beside this file in `BENCHMARKS.md`.
 
 use std::time::{Duration, Instant};
 
