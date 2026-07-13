@@ -21,10 +21,16 @@ changing the core receipt or delivery model.
 - `publish_batch`, `ack_batch`, and `nack_batch` are atomic by default and have
   a configured maximum size. This gives callers one WAL commit without letting
   a huge batch monopolize SQLite's only writer.
-- Idempotency keys are scoped to this message log. A duplicate returns the
-  original message ID and does not create more consumer deliveries. Keys should
-  be retained forever by default; an explicit retention window can trade that
-  guarantee for bounded storage.
+- Idempotency keys are scoped to this message log. The first publish records its
+  message ID for `Config::idempotency_window` (24 hours by default). Duplicates
+  return that ID without creating deliveries, including after the message has
+  been acknowledged or pruned. The window does not slide on duplicates; an
+  expired key may publish again, and the next keyed publish removes all expired
+  ledger rows through the expiry index.
+- A consumer may transition once from active to draining. The transition is
+  atomic with publishing: existing deliveries remain consumable, but later
+  publishes do not fan out to it. Drained means draining with no delivery rows;
+  it is derived rather than stored, and there is deliberately no resume state.
 - A newly created consumer starts at `Now` by default. `Beginning` means the
   beginning of retained history, not necessarily the first message ever
   published.
@@ -39,7 +45,7 @@ consumer:
 
 ```sql
 CREATE TABLE messages (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     topic        TEXT,
     body         BLOB NOT NULL,
     published_at INTEGER NOT NULL
@@ -48,14 +54,17 @@ CREATE TABLE messages (
 CREATE TABLE idempotency (
     key          BLOB PRIMARY KEY,
     message_id   INTEGER,
-    expires_at   INTEGER
+    expires_at   INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
 
+CREATE INDEX idempotency_expiry ON idempotency(expires_at);
+
 CREATE TABLE consumers (
-    id            INTEGER PRIMARY KEY,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL UNIQUE,
     topic_filter  TEXT,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    draining_at   INTEGER
 ) STRICT;
 
 CREATE TABLE deliveries (
@@ -69,24 +78,31 @@ CREATE TABLE deliveries (
 
 CREATE INDEX deliveries_visible
     ON deliveries(consumer_id, visible_at, message_id);
+
+CREATE INDEX deliveries_message ON deliveries(message_id);
 ```
 
-An ack deletes a delivery. A message is eligible for retention cleanup when it
-is old enough and has no delivery referencing it. The idempotency ledger is
-separate so cleanup does not accidentally make an old key reusable.
+An ack deletes a delivery. `prune_messages` deletes a caller-bounded number of
+old messages only when no delivery references them. The idempotency ledger is
+separate, so pruning a body does not weaken deduplication during the configured
+window.
+The message-only delivery index makes both the retention eligibility check and
+the message foreign-key check proportional to that message's fan-out rather
+than scanning unrelated consumers' deliveries.
 
 Publishing is one short transaction:
 
-1. Claim the idempotency key, or return its existing message ID.
+1. Remove expired idempotency entries when this is a keyed publish, then claim
+   the key or return its existing message ID.
 2. Insert the message.
-3. `INSERT INTO deliveries ... SELECT` all matching consumers.
+3. `INSERT INTO deliveries ... SELECT` all matching active consumers.
 4. Commit, then signal local pollers.
 
 `message_id` is briefly null while a transaction owns a newly inserted key.
 The transaction fills it before commit; a rollback removes both rows. SQLite's
 writer serialization means another publisher can only observe the completed
 entry. Keeping this ledger independent of a foreign key lets message retention
-delete bodies without weakening permanent deduplication.
+delete bodies without weakening the current deduplication window.
 
 SQLite serializes publish and consumer-creation transactions, so there is no
 gap at their boundary. A `Now` consumer either commits after a publish and
@@ -117,6 +133,30 @@ all three values in their predicate. Nack sets a new `visible_at` and advances
 the generation, immediately making that receipt stale; a zero delay is an
 immediate retry. The separate `delivery_count` remains suitable for retry
 policy and metrics.
+
+Visibility may also be extended using the current receipt. Extension never
+shortens the existing deadline and does not change the generation, so the same
+receipt remains valid. A stale receipt cannot extend a newer attempt.
+
+## Consumer lifecycle and inspection
+
+`begin_draining` writes `draining_at` once and wakes local pollers. Because both
+the state change and publishing take SQLite's writer lock, a concurrent publish
+is ordered wholly before or after the transition. Polling a drained consumer
+returns immediately; it cannot receive work later.
+
+Snapshots expose exact current state rather than historical counters. Per
+consumer they report total outstanding deliveries, currently ready deliveries,
+the next future visibility time, and the oldest outstanding publish time. A
+store snapshot adds retained-message, idempotency-ledger, and delivery counts.
+The shared `visible_at` field represents both leases and delayed nacks, so the
+API intentionally says `ready` and `not_ready`, not `in_flight`.
+
+Safe deletion requires a drained consumer with no deliveries. An explicit
+discard mode deletes an abandoned consumer and reports how many deliveries the
+cascade removed. Consumer IDs use `AUTOINCREMENT`, so a newly created consumer
+with the same name cannot be addressed by an old handle or receipt. The library
+does not infer worker idleness or run an automatic consumer reaper.
 
 Advantages:
 
@@ -222,8 +262,14 @@ let deliveries = email
     })
     .await?;
 
-email.ack_batch(deliveries.iter().map(Delivery::receipt)).await?;
+let receipts: Vec<_> = deliveries.iter().map(Delivery::receipt).collect();
+email.ack_batch(&receipts).await?;
 // or: email.nack(delivery.receipt(), Retry::After(Duration::from_secs(5))).await?;
+
+email.begin_draining().await?;
+if email.snapshot().await?.is_drained() {
+    fan.delete_consumer("send-email", DeleteMode::DrainedOnly).await?;
+}
 ```
 
 Suggested result types make idempotency and stale receipts visible rather than
@@ -291,22 +337,25 @@ a correctness mechanism and is not worth depending on.
   monotonic clock.
 - Use one small connection pool. More connections permit reader overlap but do
   not create more SQLite writers.
-- Run retention and expired-idempotency cleanup incrementally in bounded
-  batches, not as part of every publish.
+- Run message retention explicitly in caller-bounded batches. Expired
+  idempotency entries are indexed and removed automatically by keyed publishes.
 
-## Recommended first experiment
+## Implemented first cut
 
 Implement Shape A with only:
 
 - one log, optional exact topic, and durable named consumers;
-- atomic single/batch publish with permanent idempotency keys;
+- atomic single/batch publish with fixed-window idempotency keys and automatic
+  expired-ledger cleanup;
 - `Now` consumer creation;
-- claim with visibility timeout;
+- claim and receipt-checked visibility extension;
 - receipt-checked single/batch ack and nack;
+- terminal consumer draining, exact snapshots, guarded deletion, and bounded
+  message pruning;
 - in-process generation notification plus fallback polling.
 
 Then benchmark publish throughput against consumer count (`1, 10, 100, 1_000`),
 claim/ack batch sizes (`1, 10, 100, 1_000`), and a large inactive backlog. Those
 measurements tell us whether Shape C's extra state machine is justified. Add
-retention, replay, richer filters, and dead-letter policy only after the core
-semantics feel right.
+replay, richer filters, and dead-letter policy only after the core semantics
+feel right.

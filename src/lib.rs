@@ -4,6 +4,8 @@
 //! Delivery is at least once: polling leases messages for a visibility timeout,
 //! and an expired lease may be delivered again. Receipts are generation-bound,
 //! so stale workers cannot acknowledge a newer delivery.
+//! Consumers can stop new fan-out and drain existing deliveries, while exact
+//! snapshots and bounded cleanup expose the durable operational state.
 
 use std::{
     fmt,
@@ -27,7 +29,7 @@ const FANOUT_IDS_PER_CHUNK: usize = MAX_SQL_VARIABLES - 1;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS litefan_messages (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     topic        TEXT,
     body         BLOB NOT NULL,
     published_at INTEGER NOT NULL
@@ -35,14 +37,19 @@ CREATE TABLE IF NOT EXISTS litefan_messages (
 
 CREATE TABLE IF NOT EXISTS litefan_idempotency (
     key        BLOB PRIMARY KEY,
-    message_id INTEGER
+    message_id INTEGER,
+    expires_at INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
 
+CREATE INDEX IF NOT EXISTS litefan_idempotency_expiry
+    ON litefan_idempotency(expires_at);
+
 CREATE TABLE IF NOT EXISTS litefan_consumers (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
     name         TEXT NOT NULL UNIQUE,
     topic_filter TEXT,
-    created_at   INTEGER NOT NULL
+    created_at   INTEGER NOT NULL,
+    draining_at  INTEGER
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS litefan_deliveries (
@@ -58,9 +65,12 @@ CREATE TABLE IF NOT EXISTS litefan_deliveries (
 
 CREATE INDEX IF NOT EXISTS litefan_deliveries_visible
     ON litefan_deliveries(consumer_id, visible_at, message_id);
+
+CREATE INDEX IF NOT EXISTS litefan_deliveries_message
+    ON litefan_deliveries(message_id);
 "#;
 
-/// Connection, batching, durability, and long-poll settings.
+/// Connection, batching, durability, idempotency, and long-poll settings.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Maximum number of SQLite connections. SQLite still permits one writer.
@@ -75,6 +85,8 @@ pub struct Config {
     pub wal_autocheckpoint_pages: u32,
     /// Poll cadence used to discover commits made by another process or handle.
     pub cross_process_poll_interval: Duration,
+    /// How long a supplied idempotency key suppresses another publish.
+    pub idempotency_window: Duration,
 }
 
 impl Default for Config {
@@ -86,6 +98,7 @@ impl Default for Config {
             synchronous: SqliteSynchronous::Normal,
             wal_autocheckpoint_pages: 1_000,
             cross_process_poll_interval: Duration::from_millis(100),
+            idempotency_window: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -241,6 +254,83 @@ pub struct BatchResult {
     pub stale: usize,
 }
 
+/// Whether a consumer still accepts newly published messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsumerState {
+    Active,
+    Draining,
+}
+
+/// A point-in-time view of one durable consumer and its outstanding work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsumerSnapshot {
+    pub name: String,
+    pub filter: Filter,
+    pub state: ConsumerState,
+    pub created_at_ms: i64,
+    pub draining_at_ms: Option<i64>,
+    /// All unacknowledged deliveries, including leased and delayed deliveries.
+    pub outstanding: u64,
+    /// Deliveries whose visibility time has arrived.
+    pub ready: u64,
+    /// Earliest future visibility time among outstanding deliveries.
+    pub next_ready_at_ms: Option<i64>,
+    /// Publish time of the oldest outstanding message.
+    pub oldest_outstanding_at_ms: Option<i64>,
+}
+
+impl ConsumerSnapshot {
+    pub const fn is_empty(&self) -> bool {
+        self.outstanding == 0
+    }
+
+    pub const fn is_drained(&self) -> bool {
+        matches!(self.state, ConsumerState::Draining) && self.is_empty()
+    }
+
+    pub const fn not_ready(&self) -> u64 {
+        self.outstanding.saturating_sub(self.ready)
+    }
+}
+
+/// A point-in-time view of the durable state owned by litefan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreSnapshot {
+    pub retained_messages: u64,
+    /// Stored ledger rows, including expired rows awaiting the next keyed publish.
+    pub idempotency_keys: u64,
+    pub outstanding_deliveries: u64,
+    pub consumers: Vec<ConsumerSnapshot>,
+}
+
+/// Safety policy for deleting a durable consumer identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteMode {
+    /// Delete only after fan-out has stopped and every delivery is acknowledged.
+    DrainedOnly,
+    /// Delete immediately, discarding all outstanding deliveries.
+    DiscardOutstanding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeleteOutcome {
+    pub discarded_deliveries: u64,
+}
+
+/// Bounded message-retention cleanup options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Prune {
+    /// Delete eligible messages published strictly before this Unix timestamp.
+    pub before_ms: i64,
+    /// Maximum messages to delete in one transaction.
+    pub max_messages: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PruneOutcome {
+    pub deleted_messages: usize,
+}
+
 #[derive(Debug)]
 pub enum Error {
     Sqlx(sqlx::Error),
@@ -249,7 +339,12 @@ pub enum Error {
     EmptyConsumerName,
     InvalidConfig(&'static str),
     InvalidPoll(&'static str),
+    InvalidVisibilityTimeout,
     IncompleteIdempotencyEntry,
+    ConsumerDeleted { name: String },
+    ConsumerNotFound { name: String },
+    ConsumerNotDraining { name: String },
+    ConsumerNotEmpty { name: String, outstanding: u64 },
     ClockBeforeUnixEpoch,
     DurationOutOfRange,
     CounterOutOfRange,
@@ -272,8 +367,26 @@ impl fmt::Display for Error {
             Self::EmptyConsumerName => f.write_str("consumer name cannot be empty"),
             Self::InvalidConfig(message) => write!(f, "invalid configuration: {message}"),
             Self::InvalidPoll(message) => write!(f, "invalid poll: {message}"),
+            Self::InvalidVisibilityTimeout => {
+                f.write_str("visibility timeout must be greater than zero")
+            }
             Self::IncompleteIdempotencyEntry => {
                 f.write_str("idempotency ledger contains an incomplete entry")
+            }
+            Self::ConsumerDeleted { name } => {
+                write!(f, "consumer {name:?} has been deleted")
+            }
+            Self::ConsumerNotFound { name } => {
+                write!(f, "consumer {name:?} does not exist")
+            }
+            Self::ConsumerNotDraining { name } => {
+                write!(f, "consumer {name:?} is still active")
+            }
+            Self::ConsumerNotEmpty { name, outstanding } => {
+                write!(
+                    f,
+                    "consumer {name:?} still has {outstanding} outstanding deliveries"
+                )
             }
             Self::ClockBeforeUnixEpoch => f.write_str("system clock is before the Unix epoch"),
             Self::DurationOutOfRange => f.write_str("duration does not fit in SQLite milliseconds"),
@@ -307,6 +420,7 @@ struct Inner {
     pool: SqlitePool,
     max_batch_size: usize,
     cross_process_poll_interval: Duration,
+    idempotency_window_ms: i64,
     changes: watch::Sender<u64>,
 }
 
@@ -323,6 +437,10 @@ impl LiteFan {
 
     pub async fn open_with_config(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         validate_config(&config)?;
+        let idempotency_window_ms =
+            i64::try_from(config.idempotency_window.as_millis()).map_err(|_| {
+                Error::InvalidConfig("idempotency_window must fit in SQLite milliseconds")
+            })?;
 
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -347,6 +465,7 @@ impl LiteFan {
                 pool,
                 max_batch_size: config.max_batch_size,
                 cross_process_poll_interval: config.cross_process_poll_interval,
+                idempotency_window_ms,
                 changes,
             }),
         })
@@ -361,7 +480,7 @@ impl LiteFan {
         }
     }
 
-    /// Publish one message. An existing idempotency key is a no-op.
+    /// Publish one message. An unexpired idempotency key is a no-op.
     pub async fn publish(&self, message: Publish<'_>) -> Result<PublishOutcome> {
         Ok(self.publish_batch(&[message]).await?.remove(0))
     }
@@ -381,17 +500,23 @@ impl LiteFan {
         }
 
         let published_at = now_ms()?;
+        let expires_at = published_at
+            .checked_add(self.inner.idempotency_window_ms)
+            .ok_or(Error::DurationOutOfRange)?;
         let mut transaction = self.inner.pool.begin().await?;
+        purge_expired_idempotency(&mut transaction, published_at).await?;
         let mut outcomes = Vec::with_capacity(messages.len());
         let mut inserted_any = false;
 
         for message in messages {
             if let Some(key) = message.idempotency_key {
                 let claimed = sqlx::query(
-                    "INSERT INTO litefan_idempotency(key, message_id) VALUES (?, NULL) \
+                    "INSERT INTO litefan_idempotency(key, message_id, expires_at) \
+                     VALUES (?, NULL, ?) \
                      ON CONFLICT DO NOTHING",
                 )
                 .bind(key)
+                .bind(expires_at)
                 .execute(&mut *transaction)
                 .await?
                 .rows_affected()
@@ -423,7 +548,8 @@ impl LiteFan {
             sqlx::query(
                 "INSERT INTO litefan_deliveries(consumer_id, message_id, visible_at) \
                  SELECT id, ?, ? FROM litefan_consumers \
-                 WHERE topic_filter IS NULL OR topic_filter = ?",
+                 WHERE draining_at IS NULL \
+                   AND (topic_filter IS NULL OR topic_filter = ?)",
             )
             .bind(id)
             .bind(published_at)
@@ -492,7 +618,8 @@ impl LiteFan {
             }
             separated.push_unseparated(
                 ") AND (consumer.topic_filter IS NULL \
-                OR consumer.topic_filter = message.topic)",
+                OR consumer.topic_filter = message.topic) \
+                AND consumer.draining_at IS NULL",
             );
             query.build().execute(&mut *transaction).await?;
         }
@@ -503,6 +630,112 @@ impl LiteFan {
             .into_iter()
             .map(|id| PublishOutcome::Published { id: MessageId(id) })
             .collect())
+    }
+
+    /// Inspect all durable litefan state in one SQLite read snapshot.
+    pub async fn snapshot(&self) -> Result<StoreSnapshot> {
+        let now = now_ms()?;
+        let mut transaction = self.inner.pool.begin().await?;
+        let consumers = fetch_consumer_snapshots(&mut transaction, now, None).await?;
+        let row = sqlx::query(
+            "SELECT \
+                 (SELECT COUNT(*) FROM litefan_messages) AS retained_messages, \
+                 (SELECT COUNT(*) FROM litefan_idempotency) AS idempotency_keys, \
+                 (SELECT COUNT(*) FROM litefan_deliveries) AS outstanding_deliveries",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+
+        Ok(StoreSnapshot {
+            retained_messages: count_from_row(&row, "retained_messages")?,
+            idempotency_keys: count_from_row(&row, "idempotency_keys")?,
+            outstanding_deliveries: count_from_row(&row, "outstanding_deliveries")?,
+            consumers,
+        })
+    }
+
+    /// Delete a durable consumer identity under an explicit safety policy.
+    pub async fn delete_consumer(&self, name: &str, mode: DeleteMode) -> Result<DeleteOutcome> {
+        let mut transaction = self.inner.pool.begin().await?;
+        // Acquire SQLite's writer lock before inspecting the deletion guards,
+        // so a concurrent publish cannot add a delivery between the count and
+        // the delete.
+        sqlx::query("UPDATE litefan_consumers SET draining_at = draining_at WHERE name = ?")
+            .bind(name)
+            .execute(&mut *transaction)
+            .await?;
+        let row = sqlx::query(
+            "SELECT consumer.id, consumer.draining_at, COUNT(delivery.message_id) AS outstanding \
+             FROM litefan_consumers AS consumer \
+             LEFT JOIN litefan_deliveries AS delivery ON delivery.consumer_id = consumer.id \
+             WHERE consumer.name = ? \
+             GROUP BY consumer.id",
+        )
+        .bind(name)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| Error::ConsumerNotFound {
+            name: name.to_owned(),
+        })?;
+        let id: i64 = row.get("id");
+        let draining_at: Option<i64> = row.get("draining_at");
+        let outstanding = count_from_row(&row, "outstanding")?;
+
+        if matches!(mode, DeleteMode::DrainedOnly) {
+            if draining_at.is_none() {
+                return Err(Error::ConsumerNotDraining {
+                    name: name.to_owned(),
+                });
+            }
+            if outstanding > 0 {
+                return Err(Error::ConsumerNotEmpty {
+                    name: name.to_owned(),
+                    outstanding,
+                });
+            }
+        }
+
+        sqlx::query("DELETE FROM litefan_consumers WHERE id = ?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        self.signal_change();
+        Ok(DeleteOutcome {
+            discarded_deliveries: outstanding,
+        })
+    }
+
+    /// Delete a bounded number of old messages no consumer still references.
+    pub async fn prune_messages(&self, prune: Prune) -> Result<PruneOutcome> {
+        if prune.max_messages == 0 {
+            return Ok(PruneOutcome::default());
+        }
+        self.ensure_batch_size(prune.max_messages)?;
+        let limit = i64::try_from(prune.max_messages)
+            .map_err(|_| Error::InvalidConfig("prune max_messages must fit in SQLite"))?;
+        let result = sqlx::query(
+            "DELETE FROM litefan_messages \
+             WHERE id IN ( \
+                 SELECT message.id FROM litefan_messages AS message \
+                 WHERE message.published_at < ? \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM litefan_deliveries AS delivery \
+                       WHERE delivery.message_id = message.id \
+                   ) \
+                 ORDER BY message.id \
+                 LIMIT ? \
+             )",
+        )
+        .bind(prune.before_ms)
+        .bind(limit)
+        .execute(&self.inner.pool)
+        .await?;
+        Ok(PruneOutcome {
+            deleted_messages: usize::try_from(result.rows_affected())
+                .map_err(|_| Error::CounterOutOfRange)?,
+        })
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -550,6 +783,7 @@ impl ConsumerBuilder {
         }
 
         let now = now_ms()?;
+        let mut transaction = self.fan.inner.pool.begin().await?;
         sqlx::query(
             "INSERT INTO litefan_consumers(name, topic_filter, created_at) VALUES (?, ?, ?) \
              ON CONFLICT(name) DO NOTHING",
@@ -557,18 +791,19 @@ impl ConsumerBuilder {
         .bind(&self.name)
         .bind(self.filter.as_database_value())
         .bind(now)
-        .execute(&self.fan.inner.pool)
+        .execute(&mut *transaction)
         .await?;
 
         let row = sqlx::query("SELECT id, topic_filter FROM litefan_consumers WHERE name = ?")
             .bind(&self.name)
-            .fetch_one(&self.fan.inner.pool)
+            .fetch_one(&mut *transaction)
             .await?;
         let id: i64 = row.get("id");
         let stored_filter: Option<String> = row.get("topic_filter");
         if stored_filter.as_deref() != self.filter.as_database_value() {
             return Err(Error::ConsumerConfigurationMismatch { name: self.name });
         }
+        transaction.commit().await?;
 
         Ok(Consumer {
             fan: self.fan,
@@ -597,6 +832,51 @@ impl Consumer {
         &self.filter
     }
 
+    /// Permanently stop future fan-out while preserving outstanding deliveries.
+    ///
+    /// Returns true when this call performed the active-to-draining transition.
+    pub async fn begin_draining(&self) -> Result<bool> {
+        let draining_at = now_ms()?;
+        let changed = sqlx::query(
+            "UPDATE litefan_consumers SET draining_at = ? \
+             WHERE id = ? AND draining_at IS NULL",
+        )
+        .bind(draining_at)
+        .bind(self.id)
+        .execute(&self.fan.inner.pool)
+        .await?
+        .rows_affected()
+            == 1;
+        if changed {
+            self.fan.signal_change();
+            return Ok(true);
+        }
+
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM litefan_consumers WHERE id = ?)",
+        )
+        .bind(self.id)
+        .fetch_one(&self.fan.inner.pool)
+        .await?;
+        if exists {
+            Ok(false)
+        } else {
+            Err(self.deleted_error())
+        }
+    }
+
+    /// Inspect this consumer's durable state and outstanding work.
+    pub async fn snapshot(&self) -> Result<ConsumerSnapshot> {
+        let now = now_ms()?;
+        let mut transaction = self.fan.inner.pool.begin().await?;
+        let snapshot = fetch_consumer_snapshots(&mut transaction, now, Some(self.id))
+            .await?
+            .pop()
+            .ok_or_else(|| self.deleted_error())?;
+        transaction.commit().await?;
+        Ok(snapshot)
+    }
+
     /// Claim immediately-visible messages, waiting up to `poll.wait` if empty.
     pub async fn poll(&self, poll: Poll) -> Result<Vec<Delivery>> {
         if poll.max_messages == 0 {
@@ -604,9 +884,7 @@ impl Consumer {
         }
         self.fan.ensure_batch_size(poll.max_messages)?;
         if poll.visibility_timeout.is_zero() {
-            return Err(Error::InvalidPoll(
-                "visibility_timeout must be greater than zero",
-            ));
+            return Err(Error::InvalidVisibilityTimeout);
         }
 
         let lease_ms = duration_ms(poll.visibility_timeout)?;
@@ -618,6 +896,9 @@ impl Consumer {
             let claim = self.claim(poll.max_messages, lease_ms).await?;
             if !claim.deliveries.is_empty() {
                 return Ok(claim.deliveries);
+            }
+            if claim.draining && claim.next_visible_at.is_none() {
+                return Ok(Vec::new());
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -713,19 +994,82 @@ impl Consumer {
         })
     }
 
+    /// Extend one current delivery attempt's visibility deadline.
+    pub async fn extend_visibility(
+        &self,
+        receipt: Receipt,
+        visibility_timeout: Duration,
+    ) -> Result<bool> {
+        Ok(self
+            .extend_visibility_batch(&[receipt], visibility_timeout)
+            .await?
+            .applied
+            == 1)
+    }
+
+    /// Atomically extend current delivery attempts to one shared deadline.
+    ///
+    /// The receipt generation does not change, so successfully extended
+    /// receipts remain valid for acknowledgement.
+    pub async fn extend_visibility_batch(
+        &self,
+        receipts: &[Receipt],
+        visibility_timeout: Duration,
+    ) -> Result<BatchResult> {
+        if receipts.is_empty() {
+            return Ok(BatchResult::default());
+        }
+        self.fan.ensure_batch_size(receipts.len())?;
+        if visibility_timeout.is_zero() {
+            return Err(Error::InvalidVisibilityTimeout);
+        }
+
+        let visible_at = add_duration(now_ms()?, visibility_timeout)?;
+        let mut transaction = self.fan.inner.pool.begin().await?;
+        let mut applied = 0;
+        for receipts in receipts.chunks(RECEIPTS_PER_CHUNK) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "UPDATE litefan_deliveries SET visible_at = MAX(visible_at, ",
+            );
+            query
+                .push_bind(visible_at)
+                .push(") WHERE consumer_id = ")
+                .push_bind(self.id);
+            push_receipt_predicate(&mut query, receipts);
+            applied += query
+                .build()
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected() as usize;
+        }
+        transaction.commit().await?;
+        Ok(BatchResult {
+            applied,
+            stale: receipts.len().saturating_sub(applied),
+        })
+    }
+
     async fn claim(&self, max_messages: usize, lease_ms: i64) -> Result<Claim> {
         let now = now_ms()?;
         // Avoid taking SQLite's writer lock on every idle long-poll tick.
-        let earliest_visible_at = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT MIN(visible_at) FROM litefan_deliveries WHERE consumer_id = ?",
+        let state = sqlx::query(
+            "SELECT consumer.draining_at, MIN(delivery.visible_at) AS earliest_visible_at \
+             FROM litefan_consumers AS consumer \
+             LEFT JOIN litefan_deliveries AS delivery ON delivery.consumer_id = consumer.id \
+             WHERE consumer.id = ? \
+             GROUP BY consumer.id",
         )
         .bind(self.id)
-        .fetch_one(&self.fan.inner.pool)
-        .await?;
+        .fetch_optional(&self.fan.inner.pool)
+        .await?
+        .ok_or_else(|| self.deleted_error())?;
+        let draining = state.get::<Option<i64>, _>("draining_at").is_some();
+        let earliest_visible_at: Option<i64> = state.get("earliest_visible_at");
         if earliest_visible_at.is_none_or(|visible_at| visible_at > now) {
             return Ok(Claim {
                 deliveries: Vec::new(),
                 next_visible_at: earliest_visible_at,
+                draining,
             });
         }
 
@@ -794,20 +1138,37 @@ impl Consumer {
                 },
             });
         }
-        let next_visible_at = if deliveries.is_empty() {
-            sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT MIN(visible_at) FROM litefan_deliveries WHERE consumer_id = ?",
+        let (next_visible_at, draining) = if deliveries.is_empty() {
+            let state = sqlx::query(
+                "SELECT consumer.draining_at, MIN(delivery.visible_at) AS next_visible_at \
+                 FROM litefan_consumers AS consumer \
+                 LEFT JOIN litefan_deliveries AS delivery \
+                    ON delivery.consumer_id = consumer.id \
+                 WHERE consumer.id = ? \
+                 GROUP BY consumer.id",
             )
             .bind(self.id)
-            .fetch_one(&self.fan.inner.pool)
+            .fetch_optional(&self.fan.inner.pool)
             .await?
+            .ok_or_else(|| self.deleted_error())?;
+            (
+                state.get("next_visible_at"),
+                state.get::<Option<i64>, _>("draining_at").is_some(),
+            )
         } else {
-            None
+            (None, draining)
         };
         Ok(Claim {
             deliveries,
             next_visible_at,
+            draining,
         })
+    }
+
+    fn deleted_error(&self) -> Error {
+        Error::ConsumerDeleted {
+            name: self.name.to_string(),
+        }
     }
 }
 
@@ -822,6 +1183,7 @@ struct Lease {
 struct Claim {
     deliveries: Vec<Delivery>,
     next_visible_at: Option<i64>,
+    draining: bool,
 }
 
 async fn fetch_messages(
@@ -860,6 +1222,80 @@ async fn fetch_messages(
     Ok(messages)
 }
 
+async fn fetch_consumer_snapshots(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    now: i64,
+    consumer_id: Option<i64>,
+) -> Result<Vec<ConsumerSnapshot>> {
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT consumer.name, consumer.topic_filter, consumer.created_at, \
+                consumer.draining_at, \
+                COUNT(delivery.message_id) AS outstanding, \
+                COALESCE(SUM(CASE WHEN delivery.visible_at <= ",
+    );
+    query
+        .push_bind(now)
+        .push(
+            " THEN 1 ELSE 0 END), 0) AS ready, \
+                MIN(CASE WHEN delivery.visible_at > ",
+        )
+        .push_bind(now)
+        .push(
+            " THEN delivery.visible_at END) AS next_ready_at, \
+             MIN(message.published_at) AS oldest_outstanding_at \
+             FROM litefan_consumers AS consumer \
+             LEFT JOIN litefan_deliveries AS delivery \
+                ON delivery.consumer_id = consumer.id \
+             LEFT JOIN litefan_messages AS message ON message.id = delivery.message_id",
+        );
+    if let Some(consumer_id) = consumer_id {
+        query.push(" WHERE consumer.id = ").push_bind(consumer_id);
+    }
+    query.push(" GROUP BY consumer.id ORDER BY consumer.name");
+
+    let rows = query.build().fetch_all(&mut **transaction).await?;
+    let mut snapshots = Vec::with_capacity(rows.len());
+    for row in rows {
+        let topic_filter: Option<String> = row.get("topic_filter");
+        let draining_at_ms: Option<i64> = row.get("draining_at");
+        snapshots.push(ConsumerSnapshot {
+            name: row.get("name"),
+            filter: match topic_filter {
+                Some(topic) => Filter::Topic(topic),
+                None => Filter::All,
+            },
+            state: if draining_at_ms.is_some() {
+                ConsumerState::Draining
+            } else {
+                ConsumerState::Active
+            },
+            created_at_ms: row.get("created_at"),
+            draining_at_ms,
+            outstanding: count_from_row(&row, "outstanding")?,
+            ready: count_from_row(&row, "ready")?,
+            next_ready_at_ms: row.get("next_ready_at"),
+            oldest_outstanding_at_ms: row.get("oldest_outstanding_at"),
+        });
+    }
+    Ok(snapshots)
+}
+
+async fn purge_expired_idempotency(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    now: i64,
+) -> Result<()> {
+    sqlx::query("DELETE FROM litefan_idempotency WHERE expires_at <= ?")
+        .bind(now)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+fn count_from_row(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<u64> {
+    let value: i64 = row.try_get(column)?;
+    u64::try_from(value).map_err(|_| Error::CounterOutOfRange)
+}
+
 fn push_receipt_predicate(query: &mut QueryBuilder<'_, Sqlite>, receipts: &[Receipt]) {
     query.push(" AND (consumer_id, message_id, generation) IN (");
     for (index, receipt) in receipts.iter().enumerate() {
@@ -895,6 +1331,16 @@ fn validate_config(config: &Config) -> Result<()> {
     if config.cross_process_poll_interval.is_zero() {
         return Err(Error::InvalidConfig(
             "cross_process_poll_interval must be greater than zero",
+        ));
+    }
+    if config.idempotency_window.is_zero() {
+        return Err(Error::InvalidConfig(
+            "idempotency_window must be greater than zero",
+        ));
+    }
+    if i64::try_from(config.idempotency_window.as_millis()).is_err() {
+        return Err(Error::InvalidConfig(
+            "idempotency_window must fit in SQLite milliseconds",
         ));
     }
     Ok(())
@@ -1027,7 +1473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotency_is_permanent_and_batch_order_is_preserved() {
+    async fn idempotency_within_the_window_and_batch_order_are_preserved() {
         let (_directory, fan) = database().await;
         let consumer = fan.consumer("worker").open().await.unwrap();
         let keyed = |body: &'static [u8], key: &'static [u8]| Publish {
@@ -1057,6 +1503,68 @@ mod tests {
         assert_eq!(deliveries.len(), 2);
         assert_eq!(deliveries[0].message.body, b"first");
         assert_eq!(deliveries[1].message.body, b"second");
+    }
+
+    #[tokio::test]
+    async fn idempotency_window_is_fixed_and_expired_entries_are_cleaned_up() {
+        let (_directory, fan) = database().await;
+        let keyed = |body: &'static [u8], key: &'static [u8]| Publish {
+            topic: None,
+            body,
+            idempotency_key: Some(key),
+        };
+
+        let first = fan.publish(keyed(b"first", b"key-1")).await.unwrap();
+        fan.publish(keyed(b"other", b"key-2")).await.unwrap();
+        let original_expiry: i64 =
+            sqlx::query_scalar("SELECT expires_at FROM litefan_idempotency WHERE key = ?")
+                .bind(b"key-1".as_slice())
+                .fetch_one(fan.pool())
+                .await
+                .unwrap();
+
+        let duplicate = fan.publish(keyed(b"ignored", b"key-1")).await.unwrap();
+        let duplicate_expiry: i64 =
+            sqlx::query_scalar("SELECT expires_at FROM litefan_idempotency WHERE key = ?")
+                .bind(b"key-1".as_slice())
+                .fetch_one(fan.pool())
+                .await
+                .unwrap();
+        assert_eq!(duplicate, PublishOutcome::Duplicate { id: first.id() });
+        assert_eq!(duplicate_expiry, original_expiry);
+
+        sqlx::query("UPDATE litefan_idempotency SET expires_at = 0")
+            .execute(fan.pool())
+            .await
+            .unwrap();
+        let after_expiry = fan.publish(keyed(b"new", b"key-3")).await.unwrap();
+        assert!(after_expiry.is_published());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM litefan_idempotency")
+                .fetch_one(fan.pool())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_key_can_publish_again() {
+        let (_directory, fan) = database().await;
+        let publish = |body: &'static [u8]| Publish {
+            topic: None,
+            body,
+            idempotency_key: Some(b"same-key"),
+        };
+        let first = fan.publish(publish(b"first")).await.unwrap();
+        sqlx::query("UPDATE litefan_idempotency SET expires_at = 0")
+            .execute(fan.pool())
+            .await
+            .unwrap();
+
+        let second = fan.publish(publish(b"second")).await.unwrap();
+        assert!(second.is_published());
+        assert_ne!(second.id(), first.id());
     }
 
     #[tokio::test]
@@ -1236,5 +1744,250 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::ConsumerConfigurationMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn draining_stops_new_fanout_and_finishes_existing_work() {
+        let (_directory, fan) = database().await;
+        let consumer = fan.consumer("worker").open().await.unwrap();
+        fan.publish(Publish::new(b"before")).await.unwrap();
+
+        assert!(consumer.begin_draining().await.unwrap());
+        assert!(!consumer.begin_draining().await.unwrap());
+        fan.publish(Publish::new(b"after-unkeyed")).await.unwrap();
+        fan.publish(Publish::new(b"after-keyed").with_idempotency_key(b"key"))
+            .await
+            .unwrap();
+
+        let deliveries = consumer.poll(immediate_poll(10)).await.unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].message.body, b"before");
+        let draining = consumer.snapshot().await.unwrap();
+        assert_eq!(draining.state, ConsumerState::Draining);
+        assert_eq!(draining.outstanding, 1);
+        assert!(!draining.is_drained());
+
+        assert!(consumer.ack(deliveries[0].receipt()).await.unwrap());
+        assert!(consumer.snapshot().await.unwrap().is_drained());
+        let empty = tokio::time::timeout(
+            Duration::from_millis(50),
+            consumer.poll(Poll {
+                wait: Duration::from_secs(1),
+                ..Poll::default()
+            }),
+        )
+        .await
+        .expect("a drained consumer should not long-poll")
+        .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn draining_long_poll_waits_for_delayed_outstanding_work() {
+        let (_directory, fan) = database().await;
+        let consumer = fan.consumer("worker").open().await.unwrap();
+        fan.publish(Publish::new(b"retry")).await.unwrap();
+        let delivery = consumer.poll(immediate_poll(1)).await.unwrap().remove(0);
+        consumer.begin_draining().await.unwrap();
+        consumer
+            .nack(delivery.receipt(), Retry::After(Duration::from_millis(20)))
+            .await
+            .unwrap();
+
+        let retried = consumer
+            .poll(Poll {
+                max_messages: 1,
+                visibility_timeout: Duration::from_secs(30),
+                wait: Duration::from_millis(200),
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(retried.message.body, b"retry");
+        assert_eq!(retried.delivery_count, 2);
+        assert!(consumer.ack(retried.receipt()).await.unwrap());
+        assert!(consumer.snapshot().await.unwrap().is_drained());
+    }
+
+    #[tokio::test]
+    async fn snapshots_report_ready_deferred_and_store_counts() {
+        let (_directory, fan) = database().await;
+        let consumer = fan
+            .consumer("worker")
+            .filter(Filter::topic("jobs"))
+            .open()
+            .await
+            .unwrap();
+        fan.publish_batch(&[
+            Publish::new(b"a").with_topic("jobs"),
+            Publish::new(b"b")
+                .with_topic("jobs")
+                .with_idempotency_key(b"key"),
+        ])
+        .await
+        .unwrap();
+        let leased = consumer
+            .poll(Poll {
+                max_messages: 1,
+                visibility_timeout: Duration::from_secs(30),
+                wait: Duration::ZERO,
+            })
+            .await
+            .unwrap()
+            .remove(0);
+
+        let snapshot = consumer.snapshot().await.unwrap();
+        assert_eq!(snapshot.filter, Filter::topic("jobs"));
+        assert_eq!(snapshot.state, ConsumerState::Active);
+        assert_eq!(snapshot.outstanding, 2);
+        assert_eq!(snapshot.ready, 1);
+        assert_eq!(snapshot.not_ready(), 1);
+        assert!(snapshot.next_ready_at_ms.is_some());
+        assert!(snapshot.oldest_outstanding_at_ms.is_some());
+
+        let store = fan.snapshot().await.unwrap();
+        assert_eq!(store.retained_messages, 2);
+        assert_eq!(store.idempotency_keys, 1);
+        assert_eq!(store.outstanding_deliveries, 2);
+        assert_eq!(store.consumers, [snapshot]);
+        assert!(consumer.ack(leased.receipt()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn safe_deletion_requires_a_drained_consumer_and_old_handles_stay_deleted() {
+        let (_directory, fan) = database().await;
+        let consumer = fan.consumer("worker").open().await.unwrap();
+        fan.publish(Publish::new(b"work")).await.unwrap();
+
+        let error = fan
+            .delete_consumer("worker", DeleteMode::DrainedOnly)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ConsumerNotDraining { .. }));
+        consumer.begin_draining().await.unwrap();
+        let error = fan
+            .delete_consumer("worker", DeleteMode::DrainedOnly)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ConsumerNotEmpty { outstanding: 1, .. }
+        ));
+
+        let delivery = consumer.poll(immediate_poll(1)).await.unwrap().remove(0);
+        consumer.ack(delivery.receipt()).await.unwrap();
+        let deleted = fan
+            .delete_consumer("worker", DeleteMode::DrainedOnly)
+            .await
+            .unwrap();
+        assert_eq!(deleted.discarded_deliveries, 0);
+
+        let replacement = fan.consumer("worker").open().await.unwrap();
+        fan.publish(Publish::new(b"new identity")).await.unwrap();
+        assert!(matches!(
+            consumer.poll(immediate_poll(1)).await,
+            Err(Error::ConsumerDeleted { .. })
+        ));
+        assert_eq!(
+            replacement.poll(immediate_poll(1)).await.unwrap()[0]
+                .message
+                .body,
+            b"new identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_deletion_reports_discarded_deliveries() {
+        let (_directory, fan) = database().await;
+        fan.consumer("worker").open().await.unwrap();
+        fan.publish_batch(&[Publish::new(b"a"), Publish::new(b"b")])
+            .await
+            .unwrap();
+
+        let deleted = fan
+            .delete_consumer("worker", DeleteMode::DiscardOutstanding)
+            .await
+            .unwrap();
+        assert_eq!(deleted.discarded_deliveries, 2);
+        assert_eq!(fan.snapshot().await.unwrap().outstanding_deliveries, 0);
+    }
+
+    #[tokio::test]
+    async fn pruning_is_bounded_preserves_live_deliveries_and_keeps_idempotency() {
+        let (_directory, fan) = database().await;
+        let consumer = fan.consumer("worker").open().await.unwrap();
+        let keyed = Publish::new(b"keyed").with_idempotency_key(b"key");
+        let keyed_id = fan.publish(keyed).await.unwrap().id();
+        fan.publish_batch(&[Publish::new(b"a"), Publish::new(b"b")])
+            .await
+            .unwrap();
+
+        let prune = Prune {
+            before_ms: i64::MAX,
+            max_messages: 2,
+        };
+        assert_eq!(fan.prune_messages(prune).await.unwrap().deleted_messages, 0);
+        let deliveries = consumer.poll(immediate_poll(10)).await.unwrap();
+        consumer
+            .ack_batch(&deliveries.iter().map(Delivery::receipt).collect::<Vec<_>>())
+            .await
+            .unwrap();
+
+        assert_eq!(fan.prune_messages(prune).await.unwrap().deleted_messages, 2);
+        assert_eq!(fan.snapshot().await.unwrap().retained_messages, 1);
+        assert_eq!(
+            fan.publish(keyed).await.unwrap(),
+            PublishOutcome::Duplicate { id: keyed_id }
+        );
+        assert!(consumer.poll(immediate_poll(1)).await.unwrap().is_empty());
+        assert_eq!(fan.prune_messages(prune).await.unwrap().deleted_messages, 1);
+        assert_eq!(fan.snapshot().await.unwrap().idempotency_keys, 1);
+    }
+
+    #[tokio::test]
+    async fn visibility_can_be_extended_without_replacing_the_receipt() {
+        let (_directory, fan) = database().await;
+        let consumer = fan.consumer("worker").open().await.unwrap();
+        fan.publish(Publish::new(b"work")).await.unwrap();
+        let delivery = consumer
+            .poll(Poll {
+                max_messages: 1,
+                visibility_timeout: Duration::from_millis(10),
+                wait: Duration::ZERO,
+            })
+            .await
+            .unwrap()
+            .remove(0);
+
+        assert!(
+            consumer
+                .extend_visibility(delivery.receipt(), Duration::from_millis(200))
+                .await
+                .unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(consumer.poll(immediate_poll(1)).await.unwrap().is_empty());
+        assert!(consumer.ack(delivery.receipt()).await.unwrap());
+        assert!(
+            !consumer
+                .extend_visibility(delivery.receipt(), Duration::from_secs(1))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_idempotency_window_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = LiteFan::open_with_config(
+            directory.path().join("fan.db"),
+            Config {
+                idempotency_window: Duration::ZERO,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidConfig(_)));
     }
 }
