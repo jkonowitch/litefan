@@ -62,7 +62,8 @@ CREATE TABLE deliveries (
     consumer_id  INTEGER NOT NULL REFERENCES consumers(id) ON DELETE CASCADE,
     message_id   INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     visible_at   INTEGER NOT NULL,
-    attempt      INTEGER NOT NULL DEFAULT 0,
+    generation   INTEGER NOT NULL DEFAULT 0,
+    delivery_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (consumer_id, message_id)
 ) STRICT, WITHOUT ROWID;
 
@@ -97,7 +98,8 @@ Claim up to `N` messages with an atomic update:
 ```sql
 UPDATE deliveries
    SET visible_at = :lease_deadline,
-       attempt = attempt + 1
+       generation = generation + 1,
+       delivery_count = delivery_count + 1
  WHERE (consumer_id, message_id) IN (
      SELECT consumer_id, message_id
        FROM deliveries
@@ -106,13 +108,15 @@ UPDATE deliveries
       ORDER BY visible_at, message_id
       LIMIT :limit
  )
-RETURNING message_id, attempt;
+RETURNING message_id, generation, delivery_count;
 ```
 
 Fetch the bodies for the returned IDs on the same connection. The opaque
-receipt contains `(consumer_id, message_id, attempt)`. Ack and nack include all
-three values in their predicate. Nack sets a new `visible_at`; a zero delay is
-an immediate retry.
+receipt contains `(consumer_id, message_id, generation)`. Ack and nack include
+all three values in their predicate. Nack sets a new `visible_at` and advances
+the generation, immediately making that receipt stale; a zero delay is an
+immediate retry. The separate `delivery_count` remains suitable for retry
+policy and metrics.
 
 Advantages:
 
@@ -198,8 +202,7 @@ let fan = LiteFan::open("events.db").await?;
 
 let email = fan
     .consumer("send-email")
-    .filter(Filter::Topic("user.created"))
-    .start_at(StartAt::Now)
+    .filter(Filter::topic("user.created"))
     .open()
     .await?;
 
@@ -307,3 +310,18 @@ claim/ack batch sizes (`1, 10, 100, 1_000`), and a large inactive backlog. Those
 measurements tell us whether Shape C's extra state machine is justified. Add
 retention, replay, richer filters, and dead-letter policy only after the core
 semantics feel right.
+
+### Initial spike result
+
+The first implementation uses set-based inserts for unkeyed publish batches.
+On the development machine, a release-mode smoke test produced roughly:
+
+- 220k messages/s when publishing 1,000 messages to one consumer;
+- 1.4-1.5M delivery-row inserts/s at 100 and 1,000 consumers;
+- 325k claim-and-ack messages/s with batches of 500;
+- 44k new keyed messages/s and 105k duplicate keyed no-ops/s;
+- 820k messages/s while building a 100,000-row inactive backlog.
+
+These are directional rather than promises; storage, SQLite build, durability
+settings, payload size, and hardware all matter. They are sufficient to keep
+Shape A as v1. The included `examples/benchmark.rs` reproduces the smoke test.
