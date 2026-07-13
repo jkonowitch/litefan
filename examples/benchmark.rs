@@ -1,4 +1,4 @@
-//! Informational performance smoke test for the initial materialized-inbox design.
+//! Informational performance smoke test for the lazy-inbox design.
 //!
 //! Run with: `cargo run --release --example benchmark`
 //! Results and interpretation live beside this file in `BENCHMARKS.md`.
@@ -42,7 +42,7 @@ async fn fanout_publish(consumer_count: usize, message_count: usize) {
     let deliveries = consumer_count * message_count;
     println!(
         "publish consumers={consumer_count:4}: {message_count:5} messages / \
-         {deliveries:7} deliveries in {elapsed:?} ({:.0} msg/s, {:.0} delivery rows/s)",
+         {deliveries:7} logical deliveries in {elapsed:?} ({:.0} msg/s, {:.0} logical delivery/s)",
         rate(message_count, elapsed),
         rate(deliveries, elapsed),
     );
@@ -135,16 +135,16 @@ async fn main() {
     let (_directory, fan) = database().await;
     let inactive = fan.consumer("inactive").open().await.unwrap();
     let elapsed = publish_messages(&fan, 100_000).await;
-    let backlog: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM litefan_deliveries WHERE consumer_id = \
-         (SELECT id FROM litefan_consumers WHERE name = 'inactive')",
-    )
-    .fetch_one(fan.pool())
-    .await
-    .unwrap();
+    let backlog = inactive.snapshot().await.unwrap().outstanding;
+    let materialized: i64 = sqlx::query_scalar("SELECT count(*) FROM litefan_deliveries")
+        .fetch_one(fan.pool())
+        .await
+        .unwrap();
     assert_eq!(backlog, 100_000);
+    assert_eq!(materialized, 0);
     println!(
-        "backlog inactive: {backlog} rows published in {elapsed:?} ({:.0} msg/s)",
+        "backlog inactive: {backlog} logical / {materialized} materialized deliveries \
+         published in {elapsed:?} ({:.0} msg/s)",
         rate(backlog as usize, elapsed),
     );
     drop(inactive);

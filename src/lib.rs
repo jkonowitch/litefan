@@ -8,9 +8,10 @@
 //! snapshots and bounded cleanup expose the durable operational state.
 
 use std::{
+    collections::{HashMap, HashSet},
     fmt,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -23,9 +24,9 @@ use tokio::{sync::watch, time::Instant};
 // Stay below SQLite's historical 999-variable limit. Receipt statements bind
 // one consumer ID plus three values per receipt.
 const MAX_SQL_VARIABLES: usize = 999;
+const SCHEMA_VERSION: i64 = 1;
 const RECEIPTS_PER_CHUNK: usize = (MAX_SQL_VARIABLES - 1) / 3;
 const PUBLISHES_PER_CHUNK: usize = MAX_SQL_VARIABLES / 3;
-const FANOUT_IDS_PER_CHUNK: usize = MAX_SQL_VARIABLES - 1;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS litefan_messages (
@@ -34,6 +35,9 @@ CREATE TABLE IF NOT EXISTS litefan_messages (
     body         BLOB NOT NULL,
     published_at INTEGER NOT NULL
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS litefan_messages_topic
+    ON litefan_messages(topic, id) WHERE topic IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS litefan_idempotency (
     key        BLOB PRIMARY KEY,
@@ -49,7 +53,9 @@ CREATE TABLE IF NOT EXISTS litefan_consumers (
     name         TEXT NOT NULL UNIQUE,
     topic_filter TEXT,
     created_at   INTEGER NOT NULL,
-    draining_at  INTEGER
+    draining_at  INTEGER,
+    scan_cursor  INTEGER NOT NULL CHECK (scan_cursor >= 0),
+    drain_cursor INTEGER CHECK (drain_cursor >= scan_cursor)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS litefan_deliveries (
@@ -97,7 +103,7 @@ impl Default for Config {
             busy_timeout: Duration::from_secs(5),
             synchronous: SqliteSynchronous::Normal,
             wal_autocheckpoint_pages: 1_000,
-            cross_process_poll_interval: Duration::from_millis(100),
+            cross_process_poll_interval: Duration::from_millis(250),
             idempotency_window: Duration::from_secs(24 * 60 * 60),
         }
     }
@@ -340,6 +346,8 @@ pub enum Error {
     InvalidConfig(&'static str),
     InvalidPoll(&'static str),
     InvalidVisibilityTimeout,
+    IncompatibleSchema,
+    UnsupportedSchemaVersion { found: i64, maximum: i64 },
     IncompleteIdempotencyEntry,
     ConsumerDeleted { name: String },
     ConsumerNotFound { name: String },
@@ -368,8 +376,15 @@ impl fmt::Display for Error {
             Self::InvalidConfig(message) => write!(f, "invalid configuration: {message}"),
             Self::InvalidPoll(message) => write!(f, "invalid poll: {message}"),
             Self::InvalidVisibilityTimeout => {
-                f.write_str("visibility timeout must be greater than zero")
+                f.write_str("visibility timeout must be at least one millisecond")
             }
+            Self::IncompatibleSchema => {
+                f.write_str("database contains an incompatible unversioned litefan schema")
+            }
+            Self::UnsupportedSchemaVersion { found, maximum } => write!(
+                f,
+                "database schema version {found} is newer than supported version {maximum}"
+            ),
             Self::IncompleteIdempotencyEntry => {
                 f.write_str("idempotency ledger contains an incomplete entry")
             }
@@ -421,7 +436,94 @@ struct Inner {
     max_batch_size: usize,
     cross_process_poll_interval: Duration,
     idempotency_window_ms: i64,
-    changes: watch::Sender<u64>,
+    signals: Signals,
+}
+
+#[derive(Debug)]
+struct Signal {
+    generation: watch::Sender<u64>,
+}
+
+impl Signal {
+    fn new() -> Arc<Self> {
+        let (generation, _) = watch::channel(0);
+        Arc::new(Self { generation })
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+
+    fn notify(&self) {
+        self.generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
+/// In-process notifications are only a latency hint; SQLite remains the source
+/// of truth. Weak entries keep the registry bounded by live consumer handles.
+#[derive(Debug)]
+struct Signals {
+    all_publishes: Arc<Signal>,
+    topics: Mutex<HashMap<String, Weak<Signal>>>,
+    consumers: Mutex<HashMap<i64, Weak<Signal>>>,
+}
+
+impl Signals {
+    fn new() -> Self {
+        Self {
+            all_publishes: Signal::new(),
+            topics: Mutex::new(HashMap::new()),
+            consumers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn publishes_for(&self, filter: &Filter) -> Arc<Signal> {
+        match filter {
+            Filter::All => self.all_publishes.clone(),
+            Filter::Topic(topic) => signal_for_key(&self.topics, topic.clone()),
+        }
+    }
+
+    fn consumer(&self, id: i64) -> Arc<Signal> {
+        signal_for_key(&self.consumers, id)
+    }
+
+    fn notify_publishes<'a>(&self, topics: impl IntoIterator<Item = Option<&'a str>>) {
+        self.all_publishes.notify();
+
+        let topics: HashSet<&str> = topics.into_iter().flatten().collect();
+        let mut signals = self.topics.lock().unwrap();
+        for topic in topics {
+            if let Some(signal) = signals.get(topic).and_then(Weak::upgrade) {
+                signal.notify();
+            } else {
+                signals.remove(topic);
+            }
+        }
+    }
+
+    fn notify_consumer(&self, id: i64) {
+        let mut signals = self.consumers.lock().unwrap();
+        if let Some(signal) = signals.get(&id).and_then(Weak::upgrade) {
+            signal.notify();
+        } else {
+            signals.remove(&id);
+        }
+    }
+}
+
+fn signal_for_key<K>(signals: &Mutex<HashMap<K, Weak<Signal>>>, key: K) -> Arc<Signal>
+where
+    K: Eq + std::hash::Hash,
+{
+    let mut signals = signals.lock().unwrap();
+    if let Some(signal) = signals.get(&key).and_then(Weak::upgrade) {
+        return signal;
+    }
+    let signal = Signal::new();
+    signals.insert(key, Arc::downgrade(&signal));
+    signal
 }
 
 /// A cloneable handle to a SQLite fan-out database.
@@ -437,6 +539,7 @@ impl LiteFan {
 
     pub async fn open_with_config(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         validate_config(&config)?;
+        let path = path.as_ref();
         let idempotency_window_ms =
             i64::try_from(config.idempotency_window.as_millis()).map_err(|_| {
                 Error::InvalidConfig("idempotency_window must fit in SQLite milliseconds")
@@ -454,19 +557,40 @@ impl LiteFan {
                 config.wal_autocheckpoint_pages.to_string(),
             );
         let pool = SqlitePoolOptions::new()
-            .max_connections(config.max_connections)
+            // Separate `:memory:` connections are separate databases.
+            .max_connections(if path == Path::new(":memory:") {
+                1
+            } else {
+                config.max_connections
+            })
             .connect_with(options)
             .await?;
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        if schema_version > SCHEMA_VERSION {
+            return Err(Error::UnsupportedSchemaVersion {
+                found: schema_version,
+                maximum: SCHEMA_VERSION,
+            });
+        }
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
-        let (changes, _) = watch::channel(0);
-
+        sqlx::query("SELECT scan_cursor, drain_cursor FROM litefan_consumers LIMIT 0")
+            .execute(&pool)
+            .await
+            .map_err(|_| Error::IncompatibleSchema)?;
+        if schema_version < SCHEMA_VERSION {
+            sqlx::query("PRAGMA user_version = 1")
+                .execute(&pool)
+                .await?;
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 pool,
                 max_batch_size: config.max_batch_size,
                 cross_process_poll_interval: config.cross_process_poll_interval,
                 idempotency_window_ms,
-                changes,
+                signals: Signals::new(),
             }),
         })
     }
@@ -505,73 +629,107 @@ impl LiteFan {
             .ok_or(Error::DurationOutOfRange)?;
         let mut transaction = self.inner.pool.begin().await?;
         purge_expired_idempotency(&mut transaction, published_at).await?;
-        let mut outcomes = Vec::with_capacity(messages.len());
-        let mut inserted_any = false;
+        let unique_keys: Vec<&[u8]> = messages
+            .iter()
+            .filter_map(|message| message.idempotency_key)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
 
-        for message in messages {
-            if let Some(key) = message.idempotency_key {
-                let claimed = sqlx::query(
-                    "INSERT INTO litefan_idempotency(key, message_id, expires_at) \
-                     VALUES (?, NULL, ?) \
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(key)
-                .bind(expires_at)
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected()
-                    == 1;
-
-                if !claimed {
-                    let id = sqlx::query_scalar::<_, Option<i64>>(
-                        "SELECT message_id FROM litefan_idempotency WHERE key = ?",
-                    )
-                    .bind(key)
-                    .fetch_one(&mut *transaction)
-                    .await?
-                    .ok_or(Error::IncompleteIdempotencyEntry)?;
-                    outcomes.push(PublishOutcome::Duplicate { id: MessageId(id) });
-                    continue;
-                }
-            }
-
-            let result = sqlx::query(
-                "INSERT INTO litefan_messages(topic, body, published_at) VALUES (?, ?, ?)",
-            )
-            .bind(message.topic)
-            .bind(message.body)
-            .bind(published_at)
-            .execute(&mut *transaction)
-            .await?;
-            let id = result.last_insert_rowid();
-
-            sqlx::query(
-                "INSERT INTO litefan_deliveries(consumer_id, message_id, visible_at) \
-                 SELECT id, ?, ? FROM litefan_consumers \
-                 WHERE draining_at IS NULL \
-                   AND (topic_filter IS NULL OR topic_filter = ?)",
-            )
-            .bind(id)
-            .bind(published_at)
-            .bind(message.topic)
-            .execute(&mut *transaction)
-            .await?;
-
-            if let Some(key) = message.idempotency_key {
-                sqlx::query("UPDATE litefan_idempotency SET message_id = ? WHERE key = ?")
-                    .bind(id)
-                    .bind(key)
-                    .execute(&mut *transaction)
-                    .await?;
-            }
-
-            outcomes.push(PublishOutcome::Published { id: MessageId(id) });
-            inserted_any = true;
+        for keys in unique_keys.chunks(MAX_SQL_VARIABLES / 2) {
+            let mut query =
+                QueryBuilder::<Sqlite>::new("INSERT INTO litefan_idempotency(key, expires_at) ");
+            query.push_values(keys, |mut row, key| {
+                row.push_bind(*key).push_bind(expires_at);
+            });
+            query.push(" ON CONFLICT DO NOTHING");
+            query.build().execute(&mut *transaction).await?;
         }
 
+        let mut ledger = HashMap::<Vec<u8>, Option<i64>>::with_capacity(unique_keys.len());
+        for keys in unique_keys.chunks(MAX_SQL_VARIABLES) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT key, message_id FROM litefan_idempotency WHERE key IN (",
+            );
+            let mut separated = query.separated(", ");
+            for key in keys {
+                separated.push_bind(*key);
+            }
+            separated.push_unseparated(")");
+            for row in query.build().fetch_all(&mut *transaction).await? {
+                ledger.insert(row.get("key"), row.get("message_id"));
+            }
+        }
+
+        let mut scheduled_keys = HashSet::<Vec<u8>>::new();
+        let mut publish_positions = Vec::with_capacity(messages.len());
+        let mut to_publish = Vec::with_capacity(messages.len());
+        for (index, message) in messages.iter().copied().enumerate() {
+            let should_publish = match message.idempotency_key {
+                None => true,
+                Some(key) => {
+                    ledger.get(key).is_some_and(Option::is_none)
+                        && scheduled_keys.insert(key.to_vec())
+                }
+            };
+            if should_publish {
+                publish_positions.push(index);
+                to_publish.push(message);
+            }
+        }
+
+        let ids = insert_message_rows(&mut transaction, &to_publish, published_at).await?;
+        let published_ids: HashMap<usize, i64> = publish_positions
+            .iter()
+            .copied()
+            .zip(ids.iter().copied())
+            .collect();
+        let updates: Vec<(&[u8], i64)> = publish_positions
+            .iter()
+            .copied()
+            .zip(ids.iter().copied())
+            .filter_map(|(index, id)| messages[index].idempotency_key.map(|key| (key, id)))
+            .collect();
+
+        for updates in updates.chunks(MAX_SQL_VARIABLES / 2) {
+            let mut query = QueryBuilder::<Sqlite>::new("WITH updates(key, message_id) AS (");
+            query.push_values(updates, |mut row, (key, id)| {
+                row.push_bind(*key).push_bind(*id);
+            });
+            query.push(
+                ") UPDATE litefan_idempotency \
+                 SET message_id = (SELECT updates.message_id FROM updates \
+                                    WHERE updates.key = litefan_idempotency.key) \
+                 WHERE key IN (SELECT key FROM updates)",
+            );
+            query.build().execute(&mut *transaction).await?;
+        }
+        for (key, id) in &updates {
+            ledger.insert(key.to_vec(), Some(*id));
+        }
+
+        let outcomes: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                if let Some(id) = published_ids.get(&index) {
+                    return Ok(PublishOutcome::Published { id: MessageId(*id) });
+                }
+                let id = message
+                    .idempotency_key
+                    .and_then(|key| ledger.get(key))
+                    .copied()
+                    .flatten()
+                    .ok_or(Error::IncompleteIdempotencyEntry)?;
+                Ok(PublishOutcome::Duplicate { id: MessageId(id) })
+            })
+            .collect::<Result<_>>()?;
+
         transaction.commit().await?;
-        if inserted_any {
-            self.signal_change();
+        if !to_publish.is_empty() {
+            self.inner
+                .signals
+                .notify_publishes(to_publish.iter().map(|message| message.topic));
         }
         Ok(outcomes)
     }
@@ -579,53 +737,12 @@ impl LiteFan {
     async fn publish_unkeyed_batch(&self, messages: &[Publish<'_>]) -> Result<Vec<PublishOutcome>> {
         let published_at = now_ms()?;
         let mut transaction = self.inner.pool.begin().await?;
-        let mut ids = Vec::with_capacity(messages.len());
-
-        for messages in messages.chunks(PUBLISHES_PER_CHUNK) {
-            let mut query = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO litefan_messages(topic, body, published_at) ",
-            );
-            query.push_values(messages, |mut row, message| {
-                row.push_bind(message.topic)
-                    .push_bind(message.body)
-                    .push_bind(published_at);
-            });
-            query.push(" RETURNING id");
-            ids.extend(
-                query
-                    .build_query_scalar::<i64>()
-                    .fetch_all(&mut *transaction)
-                    .await?,
-            );
-        }
-        // SQLite does not promise RETURNING order. With one writer and no
-        // message triggers, row IDs are assigned in VALUES order.
-        ids.sort_unstable();
-
-        for ids in ids.chunks(FANOUT_IDS_PER_CHUNK) {
-            let mut query = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO litefan_deliveries(consumer_id, message_id, visible_at) \
-                 SELECT consumer.id, message.id, ",
-            );
-            query.push_bind(published_at).push(
-                " FROM litefan_consumers AS consumer \
-                        CROSS JOIN litefan_messages AS message \
-                        WHERE message.id IN (",
-            );
-            let mut separated = query.separated(", ");
-            for id in ids {
-                separated.push_bind(id);
-            }
-            separated.push_unseparated(
-                ") AND (consumer.topic_filter IS NULL \
-                OR consumer.topic_filter = message.topic) \
-                AND consumer.draining_at IS NULL",
-            );
-            query.build().execute(&mut *transaction).await?;
-        }
+        let ids = insert_message_rows(&mut transaction, messages, published_at).await?;
 
         transaction.commit().await?;
-        self.signal_change();
+        self.inner
+            .signals
+            .notify_publishes(messages.iter().map(|message| message.topic));
         Ok(ids
             .into_iter()
             .map(|id| PublishOutcome::Published { id: MessageId(id) })
@@ -637,11 +754,15 @@ impl LiteFan {
         let now = now_ms()?;
         let mut transaction = self.inner.pool.begin().await?;
         let consumers = fetch_consumer_snapshots(&mut transaction, now, None).await?;
+        let outstanding_deliveries = consumers.iter().try_fold(0_u64, |total, consumer| {
+            total
+                .checked_add(consumer.outstanding)
+                .ok_or(Error::CounterOutOfRange)
+        })?;
         let row = sqlx::query(
             "SELECT \
                  (SELECT COUNT(*) FROM litefan_messages) AS retained_messages, \
-                 (SELECT COUNT(*) FROM litefan_idempotency) AS idempotency_keys, \
-                 (SELECT COUNT(*) FROM litefan_deliveries) AS outstanding_deliveries",
+                 (SELECT COUNT(*) FROM litefan_idempotency) AS idempotency_keys",
         )
         .fetch_one(&mut *transaction)
         .await?;
@@ -650,7 +771,7 @@ impl LiteFan {
         Ok(StoreSnapshot {
             retained_messages: count_from_row(&row, "retained_messages")?,
             idempotency_keys: count_from_row(&row, "idempotency_keys")?,
-            outstanding_deliveries: count_from_row(&row, "outstanding_deliveries")?,
+            outstanding_deliveries,
             consumers,
         })
     }
@@ -666,11 +787,16 @@ impl LiteFan {
             .execute(&mut *transaction)
             .await?;
         let row = sqlx::query(
-            "SELECT consumer.id, consumer.draining_at, COUNT(delivery.message_id) AS outstanding \
-             FROM litefan_consumers AS consumer \
-             LEFT JOIN litefan_deliveries AS delivery ON delivery.consumer_id = consumer.id \
-             WHERE consumer.name = ? \
-             GROUP BY consumer.id",
+            "SELECT consumer.id, consumer.draining_at, \
+                    (SELECT COUNT(*) FROM litefan_deliveries AS delivery \
+                      WHERE delivery.consumer_id = consumer.id) + \
+                    (SELECT COUNT(*) FROM litefan_messages AS message \
+                      WHERE message.id > consumer.scan_cursor \
+                        AND (consumer.drain_cursor IS NULL \
+                             OR message.id <= consumer.drain_cursor) \
+                        AND (consumer.topic_filter IS NULL \
+                             OR message.topic = consumer.topic_filter)) AS outstanding \
+             FROM litefan_consumers AS consumer WHERE consumer.name = ?",
         )
         .bind(name)
         .fetch_optional(&mut *transaction)
@@ -701,7 +827,7 @@ impl LiteFan {
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
-        self.signal_change();
+        self.inner.signals.notify_consumer(id);
         Ok(DeleteOutcome {
             discarded_deliveries: outstanding,
         })
@@ -723,6 +849,14 @@ impl LiteFan {
                    AND NOT EXISTS ( \
                        SELECT 1 FROM litefan_deliveries AS delivery \
                        WHERE delivery.message_id = message.id \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM litefan_consumers AS consumer \
+                       WHERE message.id > consumer.scan_cursor \
+                         AND (consumer.drain_cursor IS NULL \
+                              OR message.id <= consumer.drain_cursor) \
+                         AND (consumer.topic_filter IS NULL \
+                              OR message.topic = consumer.topic_filter) \
                    ) \
                  ORDER BY message.id \
                  LIMIT ? \
@@ -755,12 +889,34 @@ impl LiteFan {
         }
         Ok(())
     }
+}
 
-    fn signal_change(&self) {
-        self.inner
-            .changes
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
+async fn insert_message_rows(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    messages: &[Publish<'_>],
+    published_at: i64,
+) -> Result<Vec<i64>> {
+    let mut ids = Vec::with_capacity(messages.len());
+    for messages in messages.chunks(PUBLISHES_PER_CHUNK) {
+        let mut query =
+            QueryBuilder::<Sqlite>::new("INSERT INTO litefan_messages(topic, body, published_at) ");
+        query.push_values(messages, |mut row, message| {
+            row.push_bind(message.topic)
+                .push_bind(message.body)
+                .push_bind(published_at);
+        });
+        query.push(" RETURNING id");
+        ids.extend(
+            query
+                .build_query_scalar::<i64>()
+                .fetch_all(&mut **transaction)
+                .await?,
+        );
     }
+    // SQLite does not promise RETURNING order. With one writer and no message
+    // triggers, row IDs are assigned in VALUES order.
+    ids.sort_unstable();
+    Ok(ids)
 }
 
 /// Builder for a durable named consumer. Creation starts at messages published after open.
@@ -785,7 +941,9 @@ impl ConsumerBuilder {
         let now = now_ms()?;
         let mut transaction = self.fan.inner.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO litefan_consumers(name, topic_filter, created_at) VALUES (?, ?, ?) \
+            "INSERT INTO litefan_consumers( \
+                 name, topic_filter, created_at, scan_cursor \
+             ) VALUES (?, ?, ?, (SELECT COALESCE(MAX(id), 0) FROM litefan_messages)) \
              ON CONFLICT(name) DO NOTHING",
         )
         .bind(&self.name)
@@ -806,6 +964,8 @@ impl ConsumerBuilder {
         transaction.commit().await?;
 
         Ok(Consumer {
+            publish_signal: self.fan.inner.signals.publishes_for(&self.filter),
+            consumer_signal: self.fan.inner.signals.consumer(id),
             fan: self.fan,
             id,
             name: Arc::from(self.name),
@@ -817,6 +977,8 @@ impl ConsumerBuilder {
 /// A cloneable handle to one durable consumer identity.
 #[derive(Clone, Debug)]
 pub struct Consumer {
+    publish_signal: Arc<Signal>,
+    consumer_signal: Arc<Signal>,
     fan: LiteFan,
     id: i64,
     name: Arc<str>,
@@ -838,7 +1000,12 @@ impl Consumer {
     pub async fn begin_draining(&self) -> Result<bool> {
         let draining_at = now_ms()?;
         let changed = sqlx::query(
-            "UPDATE litefan_consumers SET draining_at = ? \
+            "UPDATE litefan_consumers \
+             SET draining_at = ?, \
+                 drain_cursor = MAX( \
+                     scan_cursor, \
+                     (SELECT COALESCE(MAX(id), 0) FROM litefan_messages) \
+                 ) \
              WHERE id = ? AND draining_at IS NULL",
         )
         .bind(draining_at)
@@ -848,7 +1015,7 @@ impl Consumer {
         .rows_affected()
             == 1;
         if changed {
-            self.fan.signal_change();
+            self.consumer_signal.notify();
             return Ok(true);
         }
 
@@ -883,16 +1050,20 @@ impl Consumer {
             return Ok(Vec::new());
         }
         self.fan.ensure_batch_size(poll.max_messages)?;
-        if poll.visibility_timeout.is_zero() {
+        let lease_ms = duration_ms(poll.visibility_timeout)?;
+        if lease_ms == 0 {
             return Err(Error::InvalidVisibilityTimeout);
         }
 
-        let lease_ms = duration_ms(poll.visibility_timeout)?;
-        let deadline = Instant::now() + poll.wait;
-        let mut changes = self.fan.inner.changes.subscribe();
+        let deadline = Instant::now()
+            .checked_add(poll.wait)
+            .ok_or(Error::InvalidPoll("wait is too large"))?;
+        let mut publishes = self.publish_signal.subscribe();
+        let mut consumer_changes = self.consumer_signal.subscribe();
 
         loop {
-            changes.borrow_and_update();
+            publishes.borrow_and_update();
+            consumer_changes.borrow_and_update();
             let claim = self.claim(poll.max_messages, lease_ms).await?;
             if !claim.deliveries.is_empty() {
                 return Ok(claim.deliveries);
@@ -913,7 +1084,12 @@ impl Consumer {
             }
 
             tokio::select! {
-                changed = changes.changed() => {
+                changed = publishes.changed() => {
+                    if changed.is_err() {
+                        tokio::time::sleep(sleep_for).await;
+                    }
+                }
+                changed = consumer_changes.changed() => {
                     if changed.is_err() {
                         tokio::time::sleep(sleep_for).await;
                     }
@@ -986,7 +1162,7 @@ impl Consumer {
         }
         transaction.commit().await?;
         if applied > 0 {
-            self.fan.signal_change();
+            self.consumer_signal.notify();
         }
         Ok(BatchResult {
             applied,
@@ -1020,7 +1196,7 @@ impl Consumer {
             return Ok(BatchResult::default());
         }
         self.fan.ensure_batch_size(receipts.len())?;
-        if visibility_timeout.is_zero() {
+        if duration_ms(visibility_timeout)? == 0 {
             return Err(Error::InvalidVisibilityTimeout);
         }
 
@@ -1051,9 +1227,13 @@ impl Consumer {
 
     async fn claim(&self, max_messages: usize, lease_ms: i64) -> Result<Claim> {
         let now = now_ms()?;
-        // Avoid taking SQLite's writer lock on every idle long-poll tick.
+        // Avoid SQLite's single writer lock when this consumer has neither a
+        // visible retry nor unseen log entries.
         let state = sqlx::query(
-            "SELECT consumer.draining_at, MIN(delivery.visible_at) AS earliest_visible_at \
+            "SELECT consumer.draining_at, consumer.scan_cursor, \
+                    COALESCE(consumer.drain_cursor, \
+                        (SELECT COALESCE(MAX(id), 0) FROM litefan_messages)) AS scan_limit, \
+                    MIN(delivery.visible_at) AS earliest_visible_at \
              FROM litefan_consumers AS consumer \
              LEFT JOIN litefan_deliveries AS delivery ON delivery.consumer_id = consumer.id \
              WHERE consumer.id = ? \
@@ -1064,8 +1244,11 @@ impl Consumer {
         .await?
         .ok_or_else(|| self.deleted_error())?;
         let draining = state.get::<Option<i64>, _>("draining_at").is_some();
+        let scan_cursor: i64 = state.get("scan_cursor");
+        let scan_limit: i64 = state.get("scan_limit");
         let earliest_visible_at: Option<i64> = state.get("earliest_visible_at");
-        if earliest_visible_at.is_none_or(|visible_at| visible_at > now) {
+        let retry_ready = earliest_visible_at.is_some_and(|visible_at| visible_at <= now);
+        if !retry_ready && scan_cursor >= scan_limit {
             return Ok(Claim {
                 deliveries: Vec::new(),
                 next_visible_at: earliest_visible_at,
@@ -1075,6 +1258,30 @@ impl Consumer {
 
         let lease_deadline = now.checked_add(lease_ms).ok_or(Error::DurationOutOfRange)?;
         let mut transaction = self.fan.inner.pool.begin().await?;
+        // A no-op update takes the writer lock before we re-read the cursor.
+        // Competing workers are consequently serialized at the one point that
+        // allocates log entries to a consumer.
+        let consumer = sqlx::query(
+            "UPDATE litefan_consumers SET scan_cursor = scan_cursor \
+             WHERE id = ? \
+             RETURNING topic_filter, scan_cursor, draining_at, drain_cursor",
+        )
+        .bind(self.id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| self.deleted_error())?;
+        let topic: Option<String> = consumer.get("topic_filter");
+        let mut scan_cursor: i64 = consumer.get("scan_cursor");
+        let draining = consumer.get::<Option<i64>, _>("draining_at").is_some();
+        let scan_limit = match consumer.get::<Option<i64>, _>("drain_cursor") {
+            Some(limit) => limit,
+            None => {
+                sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(id), 0) FROM litefan_messages")
+                    .fetch_one(&mut *transaction)
+                    .await?
+            }
+        };
+
         let rows = sqlx::query(
             r#"
             UPDATE litefan_deliveries
@@ -1109,6 +1316,60 @@ impl Consumer {
                 delivery_count: row.get("delivery_count"),
             });
         }
+
+        let remaining = max_messages.saturating_sub(leases.len());
+        if remaining > 0 && scan_cursor < scan_limit {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO litefan_deliveries( \
+                     consumer_id, message_id, visible_at, generation, delivery_count \
+                 ) SELECT ",
+            );
+            query
+                .push_bind(self.id)
+                .push(", id, ")
+                .push_bind(lease_deadline)
+                .push(", 1, 1 FROM litefan_messages WHERE id > ")
+                .push_bind(scan_cursor)
+                .push(" AND id <= ")
+                .push_bind(scan_limit);
+            if let Some(topic) = topic.as_deref() {
+                query.push(" AND topic = ").push_bind(topic);
+            }
+            query
+                .push(" ORDER BY id LIMIT ")
+                .push_bind(
+                    i64::try_from(remaining)
+                        .map_err(|_| Error::InvalidPoll("max_messages is too large"))?,
+                )
+                .push(" RETURNING message_id");
+            let mut new_ids = query
+                .build_query_scalar::<i64>()
+                .fetch_all(&mut *transaction)
+                .await?;
+            new_ids.sort_unstable();
+
+            let found = new_ids.len();
+            if found < remaining {
+                scan_cursor = scan_limit;
+            } else if let Some(id) = new_ids.last() {
+                scan_cursor = *id;
+            }
+
+            if !new_ids.is_empty() {
+                leases.extend(new_ids.into_iter().map(|message_id| Lease {
+                    message_id,
+                    generation: 1,
+                    delivery_count: 1,
+                }));
+            }
+
+            sqlx::query("UPDATE litefan_consumers SET scan_cursor = ? WHERE id = ?")
+                .bind(scan_cursor)
+                .bind(self.id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+
         leases.sort_unstable_by_key(|lease| lease.message_id);
 
         let messages = fetch_messages(&mut transaction, &leases).await?;
@@ -1140,7 +1401,10 @@ impl Consumer {
         }
         let (next_visible_at, draining) = if deliveries.is_empty() {
             let state = sqlx::query(
-                "SELECT consumer.draining_at, MIN(delivery.visible_at) AS next_visible_at \
+                "SELECT consumer.draining_at, consumer.scan_cursor, \
+                        COALESCE(consumer.drain_cursor, \
+                            (SELECT COALESCE(MAX(id), 0) FROM litefan_messages)) AS scan_limit, \
+                        MIN(delivery.visible_at) AS next_visible_at \
                  FROM litefan_consumers AS consumer \
                  LEFT JOIN litefan_deliveries AS delivery \
                     ON delivery.consumer_id = consumer.id \
@@ -1151,8 +1415,15 @@ impl Consumer {
             .fetch_optional(&self.fan.inner.pool)
             .await?
             .ok_or_else(|| self.deleted_error())?;
+            let cursor: i64 = state.get("scan_cursor");
+            let limit: i64 = state.get("scan_limit");
+            let next_visible_at = if cursor < limit {
+                Some(now)
+            } else {
+                state.get("next_visible_at")
+            };
             (
-                state.get("next_visible_at"),
+                next_visible_at,
                 state.get::<Option<i64>, _>("draining_at").is_some(),
             )
         } else {
@@ -1228,30 +1499,57 @@ async fn fetch_consumer_snapshots(
     consumer_id: Option<i64>,
 ) -> Result<Vec<ConsumerSnapshot>> {
     let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT consumer.name, consumer.topic_filter, consumer.created_at, \
+        "WITH high_water(id) AS ( \
+             SELECT COALESCE(MAX(id), 0) FROM litefan_messages \
+         ) \
+         SELECT consumer.name, consumer.topic_filter, consumer.created_at, \
                 consumer.draining_at, \
-                COUNT(delivery.message_id) AS outstanding, \
-                COALESCE(SUM(CASE WHEN delivery.visible_at <= ",
+                (SELECT COUNT(*) FROM litefan_deliveries AS delivery \
+                  WHERE delivery.consumer_id = consumer.id) + \
+                (SELECT COUNT(*) FROM litefan_messages AS message, high_water \
+                  WHERE message.id > consumer.scan_cursor \
+                    AND message.id <= COALESCE(consumer.drain_cursor, high_water.id) \
+                    AND (consumer.topic_filter IS NULL \
+                         OR message.topic = consumer.topic_filter)) AS outstanding, \
+                (SELECT COUNT(*) FROM litefan_deliveries AS delivery \
+                  WHERE delivery.consumer_id = consumer.id \
+                    AND delivery.visible_at <= ",
     );
     query
         .push_bind(now)
         .push(
-            " THEN 1 ELSE 0 END), 0) AS ready, \
-                MIN(CASE WHEN delivery.visible_at > ",
+            ") + \
+                (SELECT COUNT(*) FROM litefan_messages AS message, high_water \
+                  WHERE message.id > consumer.scan_cursor \
+                    AND message.id <= COALESCE(consumer.drain_cursor, high_water.id) \
+                    AND (consumer.topic_filter IS NULL \
+                         OR message.topic = consumer.topic_filter)) AS ready, \
+                (SELECT MIN(delivery.visible_at) \
+                   FROM litefan_deliveries AS delivery \
+                  WHERE delivery.consumer_id = consumer.id \
+                    AND delivery.visible_at > ",
         )
         .push_bind(now)
         .push(
-            " THEN delivery.visible_at END) AS next_ready_at, \
-             MIN(message.published_at) AS oldest_outstanding_at \
-             FROM litefan_consumers AS consumer \
-             LEFT JOIN litefan_deliveries AS delivery \
-                ON delivery.consumer_id = consumer.id \
-             LEFT JOIN litefan_messages AS message ON message.id = delivery.message_id",
+            ") AS next_ready_at, \
+                (SELECT MIN(message.published_at) \
+                   FROM litefan_messages AS message, high_water \
+                  WHERE EXISTS ( \
+                            SELECT 1 FROM litefan_deliveries AS delivery \
+                             WHERE delivery.consumer_id = consumer.id \
+                               AND delivery.message_id = message.id \
+                        ) \
+                     OR (message.id > consumer.scan_cursor \
+                         AND message.id <= COALESCE(consumer.drain_cursor, high_water.id) \
+                         AND (consumer.topic_filter IS NULL \
+                              OR message.topic = consumer.topic_filter))) \
+                    AS oldest_outstanding_at \
+           FROM litefan_consumers AS consumer",
         );
     if let Some(consumer_id) = consumer_id {
         query.push(" WHERE consumer.id = ").push_bind(consumer_id);
     }
-    query.push(" GROUP BY consumer.id ORDER BY consumer.name");
+    query.push(" ORDER BY consumer.name");
 
     let rows = query.build().fetch_all(&mut **transaction).await?;
     let mut snapshots = Vec::with_capacity(rows.len());
@@ -1333,9 +1631,9 @@ fn validate_config(config: &Config) -> Result<()> {
             "cross_process_poll_interval must be greater than zero",
         ));
     }
-    if config.idempotency_window.is_zero() {
+    if config.idempotency_window.as_millis() == 0 {
         return Err(Error::InvalidConfig(
-            "idempotency_window must be greater than zero",
+            "idempotency_window must be at least one millisecond",
         ));
     }
     if i64::try_from(config.idempotency_window.as_millis()).is_err() {
@@ -1974,6 +2272,171 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_backlogs_are_logical_until_claimed() {
+        let (_directory, fan) = database().await;
+        let mut consumers = Vec::new();
+        for index in 0..100 {
+            consumers.push(
+                fan.consumer(format!("worker-{index}"))
+                    .open()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let publishes = vec![Publish::new(b"work"); 100];
+        fan.publish_batch(&publishes).await.unwrap();
+
+        let physical: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM litefan_deliveries")
+            .fetch_one(fan.pool())
+            .await
+            .unwrap();
+        assert_eq!(physical, 0);
+        assert_eq!(fan.snapshot().await.unwrap().outstanding_deliveries, 10_000);
+
+        let claimed = consumers[0].poll(immediate_poll(10)).await.unwrap();
+        assert_eq!(claimed.len(), 10);
+        let physical: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM litefan_deliveries")
+            .fetch_one(fan.pool())
+            .await
+            .unwrap();
+        assert_eq!(physical, 10);
+    }
+
+    #[tokio::test]
+    async fn topic_scans_skip_irrelevant_log_ranges_permanently() {
+        let (_directory, fan) = database().await;
+        let consumer = fan
+            .consumer("jobs")
+            .filter(Filter::topic("jobs"))
+            .open()
+            .await
+            .unwrap();
+        let irrelevant = vec![Publish::new(b"noise").with_topic("metrics"); 100];
+        fan.publish_batch(&irrelevant).await.unwrap();
+        fan.publish(Publish::new(b"work").with_topic("jobs"))
+            .await
+            .unwrap();
+
+        let delivery = consumer.poll(immediate_poll(10)).await.unwrap().remove(0);
+        assert_eq!(delivery.message.body, b"work");
+        consumer.ack(delivery.receipt()).await.unwrap();
+        assert!(consumer.poll(immediate_poll(10)).await.unwrap().is_empty());
+
+        let (cursor, high_water): (i64, i64) = sqlx::query_as(
+            "SELECT scan_cursor, (SELECT MAX(id) FROM litefan_messages) \
+             FROM litefan_consumers WHERE name = 'jobs'",
+        )
+        .fetch_one(fan.pool())
+        .await
+        .unwrap();
+        assert_eq!(cursor, high_water);
+    }
+
+    #[tokio::test]
+    async fn draining_after_pruning_ahead_of_the_log_is_valid() {
+        let (_directory, fan) = database().await;
+        fan.publish(Publish::new(b"history")).await.unwrap();
+        let consumer = fan.consumer("worker").open().await.unwrap();
+        assert_eq!(
+            fan.prune_messages(Prune {
+                before_ms: i64::MAX,
+                max_messages: 1,
+            })
+            .await
+            .unwrap()
+            .deleted_messages,
+            1
+        );
+        assert!(consumer.begin_draining().await.unwrap());
+        assert!(consumer.snapshot().await.unwrap().is_drained());
+    }
+
+    #[tokio::test]
+    async fn in_memory_database_uses_one_coherent_connection() {
+        let fan = LiteFan::open_with_config(
+            ":memory:",
+            Config {
+                max_connections: 8,
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap();
+        let consumer = fan.consumer("worker").open().await.unwrap();
+        fan.publish(Publish::new(b"work")).await.unwrap();
+        let delivery = consumer.poll(immediate_poll(1)).await.unwrap().remove(0);
+        assert_eq!(delivery.message.body, b"work");
+        assert!(consumer.ack(delivery.receipt()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn obsolete_unversioned_schemas_fail_at_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fan.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE litefan_consumers ( \
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let error = LiteFan::open(path).await.unwrap_err();
+        assert!(matches!(error, Error::IncompatibleSchema));
+    }
+
+    #[tokio::test]
+    async fn sub_millisecond_durable_timeouts_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = LiteFan::open_with_config(
+            directory.path().join("fan.db"),
+            Config {
+                idempotency_window: Duration::from_nanos(1),
+                ..Config::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidConfig(_)));
+
+        let (_directory, fan) = database().await;
+        let consumer = fan.consumer("worker").open().await.unwrap();
+        let error = consumer
+            .poll(Poll {
+                visibility_timeout: Duration::from_nanos(1),
+                ..immediate_poll(1)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidVisibilityTimeout));
+    }
+
+    #[tokio::test]
+    async fn an_unrepresentable_poll_deadline_is_rejected() {
+        let (_directory, fan) = database().await;
+        let consumer = fan.consumer("worker").open().await.unwrap();
+        let error = consumer
+            .poll(Poll {
+                wait: Duration::MAX,
+                ..Poll::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidPoll("wait is too large")));
     }
 
     #[tokio::test]

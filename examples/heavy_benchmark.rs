@@ -1,4 +1,4 @@
-//! Heavier concurrency scenarios for the materialized-inbox design.
+//! Heavier concurrency scenarios for the lazy-inbox design.
 //!
 //! Run with: `cargo run --release --example heavy_benchmark`
 //! Results and interpretation live beside this file in `BENCHMARKS.md`.
@@ -87,6 +87,11 @@ async fn backlog_fanout(consumer_count: usize, messages: usize) {
     let (_directory, fan) = database().await;
     let consumers = create_consumers(&fan, consumer_count, Filter::All).await;
     publish_batches(&fan, messages, 500, None, b"x").await;
+    let materialized: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM litefan_deliveries")
+        .fetch_one(fan.pool())
+        .await
+        .unwrap();
+    assert_eq!(materialized, 0);
     let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
         .fetch_one(fan.pool())
         .await
@@ -108,11 +113,12 @@ async fn backlog_fanout(consumer_count: usize, messages: usize) {
     let elapsed = started.elapsed();
     let deliveries = consumer_count * messages;
     println!(
-        "backlog fanout consumers={consumer_count:3}: {deliveries:7} deliveries, \
-         {:.1} MiB ({:.1} B/delivery), drained in {elapsed:?} \
+        "backlog fanout consumers={consumer_count:3}: {deliveries:7} logical deliveries, \
+         {materialized} materialized before claim, {:.1} MiB ({:.1} B/source message), \
+         drained in {elapsed:?} \
          ({:.0} delivery/s, {:.0} source msg/s)",
         allocated_bytes as f64 / (1024.0 * 1024.0),
-        allocated_bytes as f64 / deliveries as f64,
+        allocated_bytes as f64 / messages as f64,
         rate(deliveries, elapsed),
         rate(messages, elapsed),
     );
@@ -273,7 +279,7 @@ async fn publish_with_idle_pollers(poller_count: usize, messages: usize, batch_s
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
-    println!("idle polling (default 4-connection pool, 100 ms fallback):");
+    println!("idle polling (default 4-connection pool, 250 ms fallback):");
     for pollers in [100, 500, 1_000] {
         idle_timeout(pollers).await;
     }
