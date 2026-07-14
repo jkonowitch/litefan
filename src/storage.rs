@@ -149,7 +149,7 @@ pub(crate) fn count_from_row(row: &sqlx::sqlite::SqliteRow, column: &str) -> Res
     u64::try_from(value).map_err(|_| Error::CounterOutOfRange)
 }
 
-pub(crate) fn push_receipt_predicate(query: &mut QueryBuilder<'_, Sqlite>, receipts: &[Receipt]) {
+pub(crate) fn push_receipt_predicate(query: &mut QueryBuilder<Sqlite>, receipts: &[Receipt]) {
     query.push(" AND (consumer_id, message_id, generation) IN (");
     for (index, receipt) in receipts.iter().enumerate() {
         if index > 0 {
