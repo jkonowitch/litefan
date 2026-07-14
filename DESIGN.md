@@ -164,3 +164,20 @@ message never removes its still-live idempotency entry.
 The result keeps the state machine inspectable in ordinary SQL while removing
 the two avoidable multipliers: publish-time fan-out rows and unrelated local
 long-poll wakeups.
+
+## Code organization
+
+The crate follows the same boundaries as the design:
+
+- `api.rs` defines the public data model and configuration.
+- `store.rs` owns publishing, store snapshots, deletion, and retention.
+- `consumer.rs` owns consumer creation, leasing, receipts, and draining.
+- `storage.rs` contains shared transaction helpers and SQLite bind limits.
+- `schema.rs`, `signals.rs`, and `time.rs` isolate schema definition,
+  best-effort wakeups, and durable time conversion respectively.
+- `error.rs` is the public failure contract, while `lib.rs` is only the crate
+  map and re-export surface.
+
+Fast unit tests live beside the pure components. Public-contract integration
+tests are grouped under `tests/` by publishing, delivery, lifecycle, and
+configuration behavior.
