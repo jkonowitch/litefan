@@ -140,6 +140,7 @@ async fn safe_deletion_requires_a_drained_consumer_and_old_handles_stay_deleted(
         .await
         .unwrap();
     assert_eq!(deleted.discarded_deliveries, 0);
+    assert_eq!(deleted.discarded_archives, 0);
 
     let replacement = fan.consumer("worker").open().await.unwrap();
     fan.publish(Publish::new(b"new identity")).await.unwrap();
@@ -168,6 +169,7 @@ async fn forced_deletion_reports_discarded_deliveries() {
         .await
         .unwrap();
     assert_eq!(deleted.discarded_deliveries, 2);
+    assert_eq!(deleted.discarded_archives, 0);
     assert_eq!(fan.snapshot().await.unwrap().outstanding_deliveries, 0);
 }
 

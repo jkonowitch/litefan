@@ -140,6 +140,19 @@ async fn configured_batch_limit_is_enforced_consistently() {
         .await
         .unwrap_err();
     assert!(matches!(receipt_error, Error::BatchTooLarge { .. }));
+    let archive_error = consumer
+        .archive_batch(&[receipt, receipt, receipt])
+        .await
+        .unwrap_err();
+    assert!(matches!(archive_error, Error::BatchTooLarge { .. }));
+    let list_error = consumer
+        .archives(ListArchives {
+            after: None,
+            max_archives: 3,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(list_error, Error::BatchTooLarge { .. }));
 
     let prune_error = fan
         .prune_messages(Prune {
@@ -164,6 +177,37 @@ async fn empty_operations_are_explicit_no_ops() {
     assert_eq!(
         consumer.nack_batch(&[], Retry::Immediately).await.unwrap(),
         BatchResult::default()
+    );
+    assert_eq!(
+        consumer.archive_batch(&[]).await.unwrap(),
+        BatchResult::default()
+    );
+    assert_eq!(
+        consumer
+            .redrive_batch(&[], Retry::Immediately)
+            .await
+            .unwrap(),
+        BatchResult::default()
+    );
+    assert!(
+        consumer
+            .archives(ListArchives {
+                after: None,
+                max_archives: 0,
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        consumer
+            .purge_archives(PurgeArchives {
+                before_ms: i64::MAX,
+                max_archives: 0,
+            })
+            .await
+            .unwrap(),
+        PurgeArchivesOutcome::default()
     );
     assert_eq!(
         consumer
@@ -216,7 +260,7 @@ async fn invalid_consumer_and_schema_errors_preserve_context() {
         .connect_with(SqliteConnectOptions::new().filename(&path))
         .await
         .unwrap();
-    sqlx::query("PRAGMA user_version = 2")
+    sqlx::query("PRAGMA user_version = 3")
         .execute(&pool)
         .await
         .unwrap();
@@ -225,8 +269,8 @@ async fn invalid_consumer_and_schema_errors_preserve_context() {
     assert!(matches!(
         LiteFan::open(&path).await,
         Err(Error::UnsupportedSchemaVersion {
-            found: 2,
-            maximum: 1,
+            found: 3,
+            maximum: 2,
         })
     ));
 }

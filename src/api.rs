@@ -139,6 +139,61 @@ pub struct Delivery {
     pub(crate) receipt: Receipt,
 }
 
+/// The stable identifier assigned to one archived consumer delivery.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ArchiveId(pub(crate) i64);
+
+impl ArchiveId {
+    /// Reconstruct an archive ID persisted outside this process.
+    pub const fn new(value: i64) -> Option<Self> {
+        if value > 0 { Some(Self(value)) } else { None }
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// A terminal consumer delivery retained for inspection or redrive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchivedDelivery {
+    pub id: ArchiveId,
+    pub message: Message,
+    pub delivery_count: u64,
+    pub archived_at_ms: i64,
+    pub detail: Option<String>,
+}
+
+/// Bounded, cursor-based archive inspection options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListArchives {
+    /// Return archive IDs strictly after this cursor.
+    pub after: Option<ArchiveId>,
+    pub max_archives: usize,
+}
+
+impl Default for ListArchives {
+    fn default() -> Self {
+        Self {
+            after: None,
+            max_archives: 100,
+        }
+    }
+}
+
+/// Bounded archive-retention cleanup options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PurgeArchives {
+    /// Delete archives created strictly before this Unix timestamp.
+    pub before_ms: i64,
+    pub max_archives: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PurgeArchivesOutcome {
+    pub deleted_archives: usize,
+}
+
 impl Delivery {
     pub const fn receipt(&self) -> Receipt {
         self.receipt
@@ -209,6 +264,8 @@ pub struct ConsumerSnapshot {
     pub next_ready_at_ms: Option<i64>,
     /// Publish time of the oldest outstanding message.
     pub oldest_outstanding_at_ms: Option<i64>,
+    /// Terminal deliveries retained for inspection or redrive.
+    pub archived: u64,
 }
 
 impl ConsumerSnapshot {
@@ -232,21 +289,25 @@ pub struct StoreSnapshot {
     /// Stored ledger rows, including expired rows awaiting the next keyed publish.
     pub idempotency_keys: u64,
     pub outstanding_deliveries: u64,
+    pub archived_deliveries: u64,
     pub consumers: Vec<ConsumerSnapshot>,
 }
 
 /// Safety policy for deleting a durable consumer identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteMode {
-    /// Delete only after fan-out has stopped and every delivery is acknowledged.
+    /// Delete only after fan-out has stopped and no outstanding or archived work remains.
     DrainedOnly,
-    /// Delete immediately, discarding all outstanding deliveries.
+    /// Delete immediately and discard outstanding work, but reject retained archives.
     DiscardOutstanding,
+    /// Delete the consumer and explicitly discard outstanding and archived work.
+    DiscardAll,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeleteOutcome {
     pub discarded_deliveries: u64,
+    pub discarded_archives: u64,
 }
 
 /// Bounded message-retention cleanup options.
@@ -290,6 +351,7 @@ mod tests {
             ready: 1,
             next_ready_at_ms: Some(1),
             oldest_outstanding_at_ms: Some(0),
+            archived: 0,
         };
 
         assert!(!snapshot.is_empty());

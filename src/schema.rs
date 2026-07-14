@@ -1,4 +1,4 @@
-pub(crate) const VERSION: i64 = 1;
+pub(crate) const VERSION: i64 = 2;
 
 pub(crate) const SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS litefan_messages (
@@ -46,4 +46,23 @@ CREATE INDEX IF NOT EXISTS litefan_deliveries_visible
 
 CREATE INDEX IF NOT EXISTS litefan_deliveries_message
     ON litefan_deliveries(message_id);
+
+CREATE TABLE IF NOT EXISTS litefan_archived_deliveries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumer_id     INTEGER NOT NULL
+        REFERENCES litefan_consumers(id) ON DELETE RESTRICT,
+    message_id      INTEGER NOT NULL
+        REFERENCES litefan_messages(id) ON DELETE RESTRICT,
+    archived_at     INTEGER NOT NULL,
+    delivery_count  INTEGER NOT NULL CHECK (delivery_count >= 0),
+    last_generation INTEGER NOT NULL CHECK (last_generation >= 0),
+    detail          TEXT,
+    UNIQUE (consumer_id, message_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS litefan_archives_consumer
+    ON litefan_archived_deliveries(consumer_id, archived_at, id);
+
+CREATE INDEX IF NOT EXISTS litefan_archives_message
+    ON litefan_archived_deliveries(message_id);
 "#;

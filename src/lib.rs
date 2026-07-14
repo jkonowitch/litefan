@@ -5,7 +5,8 @@
 //! and an expired lease may be delivered again. Receipts are generation-bound,
 //! so stale workers cannot acknowledge a newer delivery.
 //! Consumers can stop new fan-out and drain existing deliveries, while exact
-//! snapshots and bounded cleanup expose the durable operational state.
+//! snapshots and bounded cleanup expose the durable operational state. Failed
+//! deliveries can be archived per consumer for inspection or redrive.
 //!
 //! # Quick start
 //!
@@ -43,9 +44,9 @@ mod store;
 mod time;
 
 pub use api::{
-    BatchResult, Config, ConsumerSnapshot, ConsumerState, DeleteMode, DeleteOutcome, Delivery,
-    Filter, Message, MessageId, Poll, Prune, PruneOutcome, Publish, PublishOutcome, Receipt, Retry,
-    StoreSnapshot,
+    ArchiveId, ArchivedDelivery, BatchResult, Config, ConsumerSnapshot, ConsumerState, DeleteMode,
+    DeleteOutcome, Delivery, Filter, ListArchives, Message, MessageId, Poll, Prune, PruneOutcome,
+    Publish, PublishOutcome, PurgeArchives, PurgeArchivesOutcome, Receipt, Retry, StoreSnapshot,
 };
 pub use consumer::{Consumer, ConsumerBuilder};
 pub use error::{Error, Result};

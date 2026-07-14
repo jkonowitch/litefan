@@ -95,7 +95,9 @@ pub(crate) async fn fetch_consumer_snapshots(
                          AND message.id <= COALESCE(consumer.drain_cursor, high_water.id) \
                          AND (consumer.topic_filter IS NULL \
                               OR message.topic = consumer.topic_filter))) \
-                    AS oldest_outstanding_at \
+                    AS oldest_outstanding_at, \
+                (SELECT COUNT(*) FROM litefan_archived_deliveries AS archive \
+                  WHERE archive.consumer_id = consumer.id) AS archived \
            FROM litefan_consumers AS consumer",
         );
     if let Some(consumer_id) = consumer_id {
@@ -125,6 +127,7 @@ pub(crate) async fn fetch_consumer_snapshots(
             ready: count_from_row(&row, "ready")?,
             next_ready_at_ms: row.get("next_ready_at"),
             oldest_outstanding_at_ms: row.get("oldest_outstanding_at"),
+            archived: count_from_row(&row, "archived")?,
         });
     }
     Ok(snapshots)

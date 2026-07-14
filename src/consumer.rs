@@ -6,8 +6,9 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::time::Instant;
 
 use crate::{
-    BatchResult, ConsumerSnapshot, Delivery, Error, Filter, LiteFan, Message, MessageId, Poll,
-    Receipt, Result, Retry,
+    ArchiveId, ArchivedDelivery, BatchResult, ConsumerSnapshot, Delivery, Error, Filter,
+    ListArchives, LiteFan, Message, MessageId, Poll, PurgeArchives, PurgeArchivesOutcome, Receipt,
+    Result, Retry,
     signals::Signal,
     storage::{
         Lease, MAX_SQL_VARIABLES, RECEIPTS_PER_CHUNK, fetch_consumer_snapshots,
@@ -42,7 +43,6 @@ impl ConsumerBuilder {
         if self.name.is_empty() {
             return Err(Error::EmptyConsumerName);
         }
-
         let now = now_ms()?;
         let mut transaction = self.fan.inner.pool.begin().await?;
         sqlx::query(
@@ -330,6 +330,198 @@ impl Consumer {
         })
     }
 
+    /// Retain one current delivery for inspection while removing it from delivery.
+    pub async fn archive(&self, receipt: Receipt) -> Result<bool> {
+        Ok(self.archive_batch(&[receipt]).await?.applied == 1)
+    }
+
+    /// Archive one current delivery with application-specific diagnostic detail.
+    pub async fn archive_with_detail(&self, receipt: Receipt, detail: &str) -> Result<bool> {
+        Ok(self
+            .archive_batch_with_detail(&[receipt], Some(detail))
+            .await?
+            .applied
+            == 1)
+    }
+
+    /// Atomically archive current delivery attempts with one WAL commit.
+    pub async fn archive_batch(&self, receipts: &[Receipt]) -> Result<BatchResult> {
+        self.archive_batch_with_detail(receipts, None).await
+    }
+
+    /// Atomically archive current delivery attempts with shared diagnostic detail.
+    pub async fn archive_batch_with_detail(
+        &self,
+        receipts: &[Receipt],
+        detail: Option<&str>,
+    ) -> Result<BatchResult> {
+        if receipts.is_empty() {
+            return Ok(BatchResult::default());
+        }
+        self.fan.ensure_batch_size(receipts.len())?;
+
+        let archived_at = now_ms()?;
+        let mut transaction = self.fan.inner.pool.begin().await?;
+        let mut archived = Vec::new();
+        for receipts in receipts.chunks(RECEIPTS_PER_CHUNK) {
+            let mut query =
+                QueryBuilder::<Sqlite>::new("DELETE FROM litefan_deliveries WHERE consumer_id = ");
+            query.push_bind(self.id);
+            push_receipt_predicate(&mut query, receipts);
+            query.push(" RETURNING consumer_id, message_id, generation, delivery_count");
+            archived.extend(
+                query
+                    .build()
+                    .fetch_all(&mut *transaction)
+                    .await?
+                    .into_iter()
+                    .map(ArchivedLease::from_row),
+            );
+        }
+        archived.sort_unstable_by_key(|lease| lease.message_id);
+        insert_archived_leases(&mut transaction, &archived, archived_at, detail).await?;
+        transaction.commit().await?;
+        if !archived.is_empty() {
+            self.consumer_signal.notify();
+        }
+        Ok(BatchResult {
+            applied: archived.len(),
+            stale: receipts.len().saturating_sub(archived.len()),
+        })
+    }
+
+    /// List this consumer's archives in stable archive-ID order.
+    pub async fn archives(&self, list: ListArchives) -> Result<Vec<ArchivedDelivery>> {
+        if list.max_archives == 0 {
+            return Ok(Vec::new());
+        }
+        self.fan.ensure_batch_size(list.max_archives)?;
+        let limit = i64::try_from(list.max_archives)
+            .map_err(|_| Error::InvalidConfig("archive page size must fit in SQLite"))?;
+        let after = list.after.map_or(0, ArchiveId::get);
+        let rows = sqlx::query(
+            "SELECT archive.id AS archive_id, archive.archived_at, \
+                    archive.delivery_count, archive.detail, \
+                    message.id AS message_id, message.topic, message.body, \
+                    message.published_at \
+             FROM litefan_archived_deliveries AS archive \
+             JOIN litefan_messages AS message ON message.id = archive.message_id \
+             WHERE archive.consumer_id = ? AND archive.id > ? \
+             ORDER BY archive.id LIMIT ?",
+        )
+        .bind(self.id)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&self.fan.inner.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(ArchivedDelivery {
+                    id: ArchiveId(row.get("archive_id")),
+                    message: Message {
+                        id: MessageId(row.get("message_id")),
+                        topic: row.get("topic"),
+                        body: row.get("body"),
+                        published_at_ms: row.get("published_at"),
+                    },
+                    delivery_count: u64::try_from(row.get::<i64, _>("delivery_count"))
+                        .map_err(|_| Error::CounterOutOfRange)?,
+                    archived_at_ms: row.get("archived_at"),
+                    detail: row.get("detail"),
+                })
+            })
+            .collect()
+    }
+
+    /// Restore one archived delivery to this consumer.
+    pub async fn redrive(&self, archive_id: ArchiveId, retry: Retry) -> Result<bool> {
+        Ok(self.redrive_batch(&[archive_id], retry).await?.applied == 1)
+    }
+
+    /// Atomically restore archived deliveries with a shared visibility delay.
+    ///
+    /// Delivery counts reset, so the next claim is attempt one of a new cycle.
+    pub async fn redrive_batch(
+        &self,
+        archive_ids: &[ArchiveId],
+        retry: Retry,
+    ) -> Result<BatchResult> {
+        if archive_ids.is_empty() {
+            return Ok(BatchResult::default());
+        }
+        self.fan.ensure_batch_size(archive_ids.len())?;
+        let visible_at = add_duration(now_ms()?, retry.delay())?;
+        let mut transaction = self.fan.inner.pool.begin().await?;
+        let mut message_ids = Vec::new();
+        for archive_ids in archive_ids.chunks(MAX_SQL_VARIABLES - 1) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "DELETE FROM litefan_archived_deliveries WHERE consumer_id = ",
+            );
+            query.push_bind(self.id).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for archive_id in archive_ids {
+                separated.push_bind(archive_id.get());
+            }
+            separated.push_unseparated(") RETURNING message_id");
+            message_ids.extend(
+                query
+                    .build_query_scalar::<i64>()
+                    .fetch_all(&mut *transaction)
+                    .await?,
+            );
+        }
+        for message_ids in message_ids.chunks(MAX_SQL_VARIABLES / 5) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO litefan_deliveries( \
+                     consumer_id, message_id, visible_at, generation, delivery_count \
+                 ) ",
+            );
+            query.push_values(message_ids, |mut row, message_id| {
+                row.push_bind(self.id)
+                    .push_bind(*message_id)
+                    .push_bind(visible_at)
+                    .push_bind(0_i64)
+                    .push_bind(0_i64);
+            });
+            query.build().execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
+        if !message_ids.is_empty() {
+            self.consumer_signal.notify();
+        }
+        Ok(BatchResult {
+            applied: message_ids.len(),
+            stale: archive_ids.len().saturating_sub(message_ids.len()),
+        })
+    }
+
+    /// Delete a bounded number of this consumer's old archives.
+    pub async fn purge_archives(&self, purge: PurgeArchives) -> Result<PurgeArchivesOutcome> {
+        if purge.max_archives == 0 {
+            return Ok(PurgeArchivesOutcome::default());
+        }
+        self.fan.ensure_batch_size(purge.max_archives)?;
+        let limit = i64::try_from(purge.max_archives)
+            .map_err(|_| Error::InvalidConfig("archive purge size must fit in SQLite"))?;
+        let result = sqlx::query(
+            "DELETE FROM litefan_archived_deliveries WHERE id IN ( \
+                 SELECT id FROM litefan_archived_deliveries \
+                 WHERE consumer_id = ? AND archived_at < ? \
+                 ORDER BY id LIMIT ? \
+             )",
+        )
+        .bind(self.id)
+        .bind(purge.before_ms)
+        .bind(limit)
+        .execute(&self.fan.inner.pool)
+        .await?;
+        Ok(PurgeArchivesOutcome {
+            deleted_archives: usize::try_from(result.rows_affected())
+                .map_err(|_| Error::CounterOutOfRange)?,
+        })
+    }
+
     async fn claim(&self, max_messages: usize, lease_ms: i64) -> Result<Claim> {
         let now = now_ms()?;
         // Avoid SQLite's single writer lock when this consumer has neither a
@@ -553,6 +745,51 @@ struct Claim {
     deliveries: Vec<Delivery>,
     next_visible_at: Option<i64>,
     draining: bool,
+}
+
+#[derive(Debug)]
+struct ArchivedLease {
+    consumer_id: i64,
+    message_id: i64,
+    generation: i64,
+    delivery_count: i64,
+}
+
+impl ArchivedLease {
+    fn from_row(row: sqlx::sqlite::SqliteRow) -> Self {
+        Self {
+            consumer_id: row.get("consumer_id"),
+            message_id: row.get("message_id"),
+            generation: row.get("generation"),
+            delivery_count: row.get("delivery_count"),
+        }
+    }
+}
+
+async fn insert_archived_leases(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    leases: &[ArchivedLease],
+    archived_at: i64,
+    detail: Option<&str>,
+) -> Result<()> {
+    for leases in leases.chunks(MAX_SQL_VARIABLES / 6) {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO litefan_archived_deliveries( \
+                 consumer_id, message_id, archived_at, delivery_count, \
+                 last_generation, detail \
+             ) ",
+        );
+        query.push_values(leases, |mut row, lease| {
+            row.push_bind(lease.consumer_id)
+                .push_bind(lease.message_id)
+                .push_bind(archived_at)
+                .push_bind(lease.delivery_count)
+                .push_bind(lease.generation)
+                .push_bind(detail);
+        });
+        query.build().execute(&mut **transaction).await?;
+    }
+    Ok(())
 }
 
 async fn fetch_messages(

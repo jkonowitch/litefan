@@ -5,9 +5,9 @@ Publishing stores each message once. Every durable consumer that matches the
 message eventually receives it, and workers sharing a consumer name compete
 for that consumer's copy.
 
-The design has three durable ideas: an append-only message log, one scan cursor
-per consumer, and a sparse set of materialized deliveries. Everything else is
-derived from those.
+The design has four durable ideas: an append-only message log, one scan cursor
+per consumer, a sparse set of materialized deliveries, and a terminal archive
+of exceptional per-consumer outcomes. Everything else is derived from those.
 
 ## Semantics
 
@@ -20,6 +20,8 @@ derived from those.
   the consumer advances through the log.
 - Delivery is at least once. Polling gives a message a visibility deadline; an
   expired lease can be delivered again.
+- Archiving is per consumer. It removes one consumer's delivery without
+  suppressing the shared message for other consumers.
 - A receipt identifies one lease generation. Ack, nack, and lease extension
   require the current generation, so a timed-out worker cannot mutate a newer
   worker's lease.
@@ -71,6 +73,23 @@ CREATE TABLE litefan_deliveries (
     delivery_count INTEGER NOT NULL,
     PRIMARY KEY (consumer_id, message_id)
 ) STRICT, WITHOUT ROWID;
+```
+
+An archive row replaces a materialized delivery after a terminal outcome. It
+references the shared message instead of copying its body, retaining that body
+until the archive is redriven or purged.
+
+```sql
+CREATE TABLE litefan_archived_deliveries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    consumer_id     INTEGER NOT NULL,
+    message_id      INTEGER NOT NULL,
+    archived_at     INTEGER NOT NULL,
+    delivery_count  INTEGER NOT NULL,
+    last_generation INTEGER NOT NULL,
+    detail          TEXT,
+    UNIQUE (consumer_id, message_id)
+) STRICT;
 ```
 
 Idempotency is a separate expiring ledger. It deliberately does not reference
@@ -130,12 +149,18 @@ SQLite at `cross_process_poll_interval` (250 ms by default), also waking at the
 earliest known visibility deadline. Marking generations seen before querying
 prevents lost wakeups.
 
-## Inspection, draining, deletion, and retention
+## Inspection, archives, draining, deletion, and retention
 
 Snapshots are exact logical views. Outstanding work is the sum of materialized
 deliveries and matching unscanned messages. This makes snapshots more expensive
 than hot-path polling by design; they do not require write-time counters or
 risk counter drift.
+
+Manual archive uses the same generation-bound receipts as acknowledgement and
+nack. Moving a delivery into the archive is atomic, so a stale worker cannot
+archive a newer lease. Archive listing is cursor-based and bounded. Redrive
+restores work only to its original consumer and resets the delivery count;
+purging an archive releases its reference to the shared message.
 
 Draining records both a timestamp and the current log boundary under the writer
 lock. A drained consumer has reached that boundary and has no materialized
@@ -143,9 +168,13 @@ deliveries. Safe deletion requires that state; forced deletion reports both
 unseen and materialized work it discarded.
 
 Pruning is caller-bounded. A message is eligible only when it is older than the
-requested time, no materialized delivery references it, and every matching
-consumer has scanned beyond it (or was already draining before it). Pruning a
-message never removes its still-live idempotency entry.
+requested time, no materialized or archived delivery references it, and every
+matching consumer has scanned beyond it (or was already draining before it).
+Pruning a message never removes its still-live idempotency entry.
+
+Archived deliveries do not count as outstanding, so a draining consumer may
+be drained while still retaining archives. Normal deletion rejects that state;
+discarding archives requires an explicit destructive mode or a bounded purge.
 
 ## Scaling model
 
@@ -153,6 +182,8 @@ message never removes its still-live idempotency entry.
 - An inactive consumer costs one row, regardless of backlog size.
 - Delivery work is still fundamental: `M` messages for `C` matching consumers
   ultimately require `M * C` claims, body reads, and acknowledgements.
+- Archives add one small row per exceptional consumer delivery and retain, but
+  do not duplicate, the shared message body.
 - Exact-topic scans use `(topic, id)`; all-message scans use the integer primary
   key. Sparse filters do not repeatedly rescan skipped ranges.
 - SQLite has one writer. One polling coordinator per durable consumer with

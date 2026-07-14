@@ -86,8 +86,15 @@ impl LiteFan {
             .execute(&pool)
             .await
             .map_err(|_| Error::IncompatibleSchema)?;
+        sqlx::query(
+            "SELECT consumer_id, message_id, detail \
+             FROM litefan_archived_deliveries LIMIT 0",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|_| Error::IncompatibleSchema)?;
         if schema_version < SCHEMA_VERSION {
-            sqlx::query("PRAGMA user_version = 1")
+            sqlx::query("PRAGMA user_version = 2")
                 .execute(&pool)
                 .await?;
         }
@@ -262,6 +269,11 @@ impl LiteFan {
                 .checked_add(consumer.outstanding)
                 .ok_or(Error::CounterOutOfRange)
         })?;
+        let archived_deliveries = consumers.iter().try_fold(0_u64, |total, consumer| {
+            total
+                .checked_add(consumer.archived)
+                .ok_or(Error::CounterOutOfRange)
+        })?;
         let row = sqlx::query(
             "SELECT \
                  (SELECT COUNT(*) FROM litefan_messages) AS retained_messages, \
@@ -275,6 +287,7 @@ impl LiteFan {
             retained_messages: count_from_row(&row, "retained_messages")?,
             idempotency_keys: count_from_row(&row, "idempotency_keys")?,
             outstanding_deliveries,
+            archived_deliveries,
             consumers,
         })
     }
@@ -298,7 +311,9 @@ impl LiteFan {
                         AND (consumer.drain_cursor IS NULL \
                              OR message.id <= consumer.drain_cursor) \
                         AND (consumer.topic_filter IS NULL \
-                             OR message.topic = consumer.topic_filter)) AS outstanding \
+                             OR message.topic = consumer.topic_filter)) AS outstanding, \
+                    (SELECT COUNT(*) FROM litefan_archived_deliveries AS archive \
+                      WHERE archive.consumer_id = consumer.id) AS archived \
              FROM litefan_consumers AS consumer WHERE consumer.name = ?",
         )
         .bind(name)
@@ -310,6 +325,7 @@ impl LiteFan {
         let id: i64 = row.get("id");
         let draining_at: Option<i64> = row.get("draining_at");
         let outstanding = count_from_row(&row, "outstanding")?;
+        let archived = count_from_row(&row, "archived")?;
 
         if matches!(mode, DeleteMode::DrainedOnly) {
             if draining_at.is_none() {
@@ -324,6 +340,19 @@ impl LiteFan {
                 });
             }
         }
+        if !matches!(mode, DeleteMode::DiscardAll) && archived > 0 {
+            return Err(Error::ConsumerHasArchives {
+                name: name.to_owned(),
+                archived,
+            });
+        }
+
+        if matches!(mode, DeleteMode::DiscardAll) {
+            sqlx::query("DELETE FROM litefan_archived_deliveries WHERE consumer_id = ?")
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+        }
 
         sqlx::query("DELETE FROM litefan_consumers WHERE id = ?")
             .bind(id)
@@ -333,6 +362,7 @@ impl LiteFan {
         self.inner.signals.notify_consumer(id);
         Ok(DeleteOutcome {
             discarded_deliveries: outstanding,
+            discarded_archives: archived,
         })
     }
 
@@ -352,6 +382,10 @@ impl LiteFan {
                    AND NOT EXISTS ( \
                        SELECT 1 FROM litefan_deliveries AS delivery \
                        WHERE delivery.message_id = message.id \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM litefan_archived_deliveries AS archive \
+                       WHERE archive.message_id = message.id \
                    ) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM litefan_consumers AS consumer \

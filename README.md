@@ -65,6 +65,35 @@ fan.publish(Publish::new(b"order-123").with_topic("orders"))
 Topic filters are exact matches. A consumer's filter is durable and cannot be
 changed by reopening the same name; use a new name for a new subscription.
 
+## Archives and dead letters
+
+Archiving is per consumer: it removes only that consumer's delivery while the
+shared message remains available to every other matching consumer. Archive a
+permanent failure directly, with optional diagnostic detail:
+
+```rust
+# use litefan::{ListArchives, Poll};
+# async fn example(consumer: &litefan::Consumer, delivery: litefan::Delivery) -> litefan::Result<()> {
+consumer
+    .archive_with_detail(delivery.receipt(), "invalid payload")
+    .await?;
+
+for archived in consumer.archives(ListArchives::default()).await? {
+    eprintln!("dead letter {:?}: {:?}", archived.id, archived.detail);
+}
+# Ok(())
+# }
+```
+
+Use `redrive` to restore an archive to the same consumer. Its delivery count
+resets so it begins a new attempt cycle. Redrive does not republish to other
+consumers. Purge archives with `purge_archives`; their shared message bodies
+become eligible for `prune_messages` once no other consumer needs them.
+
+Retry limits are application policy, just like backoff. Check
+`Delivery::delivery_count` and archive a permanent or exhausted failure instead
+of nacking it again.
+
 ## Best practices
 
 - **Open consumers first.** A new consumer starts after the current end of the
@@ -79,6 +108,8 @@ changed by reopening the same name; use a new name for a new subscription.
 - **Retry deliberately.** Use `nack` with a delay for transient failures. Do
   not acknowledge failed work; an unacknowledged delivery becomes available
   again after its visibility timeout.
+- **Archive permanent failures.** Include diagnostic detail when it will help
+  operators decide whether to purge or redrive the delivery.
 - **Batch busy paths.** `publish_batch`, `ack_batch`, and `nack_batch` reduce
   SQLite commits. Keep batches at or below `Config::max_batch_size` (500 by
   default).
@@ -87,7 +118,7 @@ changed by reopening the same name; use a new name for a new subscription.
 - **Keep work outside database transactions.** Poll, process, then acknowledge.
   Never hold an application transaction open while doing slow network work.
 - **Prune periodically.** Call `prune_messages` with an age cutoff and bounded
-  batch size to remove old messages no consumer still needs.
+  batch size to remove old messages no consumer or archive still needs.
 
 Dropping a worker handle is enough for a normal shutdown. Use
 `begin_draining()` only when permanently retiring a consumer: draining is

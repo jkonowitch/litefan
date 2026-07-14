@@ -16,6 +16,7 @@ pub enum Error {
     ConsumerNotFound { name: String },
     ConsumerNotDraining { name: String },
     ConsumerNotEmpty { name: String, outstanding: u64 },
+    ConsumerHasArchives { name: String, archived: u64 },
     ClockBeforeUnixEpoch,
     DurationOutOfRange,
     CounterOutOfRange,
@@ -31,7 +32,7 @@ impl fmt::Display for Error {
             }
             Self::ConsumerConfigurationMismatch { name } => write!(
                 f,
-                "consumer {name:?} already exists with a different filter"
+                "consumer {name:?} already exists with different durable configuration"
             ),
             Self::EmptyConsumerName => f.write_str("consumer name cannot be empty"),
             Self::InvalidConfig(message) => write!(f, "invalid configuration: {message}"),
@@ -55,6 +56,10 @@ impl fmt::Display for Error {
             Self::ConsumerNotEmpty { name, outstanding } => write!(
                 f,
                 "consumer {name:?} still has {outstanding} outstanding deliveries"
+            ),
+            Self::ConsumerHasArchives { name, archived } => write!(
+                f,
+                "consumer {name:?} still has {archived} archived deliveries"
             ),
             Self::ClockBeforeUnixEpoch => f.write_str("system clock is before the Unix epoch"),
             Self::DurationOutOfRange => f.write_str("duration does not fit in SQLite milliseconds"),
