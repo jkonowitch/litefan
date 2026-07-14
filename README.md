@@ -1,46 +1,111 @@
 # litefan
 
-`litefan` is a small, durable, at-least-once fan-out message log backed by
-SQLite. A message body is stored once, while every matching named consumer gets
-an independent delivery. Workers using the same consumer name compete for that
-consumer's work.
+`litefan` is a durable, at-least-once fan-out message log backed by SQLite.
+Each message is stored once, and every matching named consumer gets its own
+delivery. Multiple workers using the same consumer name share that consumer's
+work.
+
+## Quick start
+
+Create consumers before publishing messages they need to receive:
 
 ```rust
 use std::time::Duration;
-use litefan::{LiteFan, Poll, Publish};
+use litefan::{LiteFan, Poll, Publish, Retry};
 
 async fn run() -> litefan::Result<()> {
     let fan = LiteFan::open("messages.db").await?;
-    let worker = fan.consumer("email-worker").open().await?;
+    let email = fan.consumer("email-sender").open().await?;
 
-    fan.publish(Publish::new(b"welcome@example.com")).await?;
-    for delivery in worker.poll(Poll {
-        wait: Duration::ZERO,
-        ..Poll::default()
-    }).await? {
-        // Acknowledge only after processing succeeds.
-        worker.ack(delivery.receipt()).await?;
+    fan.publish(
+        Publish::new(b"welcome@example.com")
+            .with_idempotency_key(b"welcome:user-123"),
+    ).await?;
+
+    for delivery in email.poll(Poll::default()).await? {
+        match send_email(&delivery.message.body).await {
+            Ok(()) => {
+                // Acknowledge only after the side effect succeeds.
+                email.ack(delivery.receipt()).await?;
+            }
+            Err(_) => {
+                email.nack(
+                    delivery.receipt(),
+                    Retry::After(Duration::from_secs(30)),
+                ).await?;
+            }
+        }
     }
+
     Ok(())
 }
 ```
 
-The important semantics are:
+`Poll::default()` returns up to 100 messages, waits up to 20 seconds when no
+work is available, and leases each delivery for 30 seconds.
 
-- Consumer names are durable identities. Reopening a name resumes its inbox.
-- New consumers start after the current retained high-water mark, so create a
-  consumer before publishing messages it should receive.
-- Polling leases messages for a visibility timeout. Unacknowledged deliveries
-  can be retried, and stale lease receipts cannot affect a newer attempt.
-- Optional idempotency keys suppress duplicate publishes for a configured
-  window.
-- Draining permanently stops new fan-out while allowing existing work to
-  finish.
+## Topics and fan-out
 
-See [DESIGN.md](DESIGN.md) for storage invariants, transaction boundaries,
-long-poll behavior, retention rules, and the source layout.
+Use a unique, stable name for each logical subscriber. Give several worker
+instances the same name when they should compete for one inbox.
 
-Run the complete quality gate with:
+```rust
+use litefan::{Filter, Publish};
+
+let billing = fan
+    .consumer("billing-v1")
+    .filter(Filter::topic("orders"))
+    .open()
+    .await?;
+
+fan.publish(Publish::new(b"order-123").with_topic("orders"))
+    .await?;
+```
+
+Topic filters are exact matches. A consumer's filter is durable and cannot be
+changed by reopening the same name; use a new name for a new subscription.
+
+## Best practices
+
+- **Open consumers first.** A new consumer starts after the current end of the
+  log; it does not receive older messages.
+- **Expect duplicates.** A lease can expire after processing but before `ack`.
+  Make handlers idempotent, or publish with a stable idempotency key when
+  duplicate publishing is the concern. Keys suppress repeats for 24 hours by
+  default.
+- **Set a realistic visibility timeout.** It should exceed normal processing
+  time. Call `extend_visibility` before the lease expires for unusually long
+  work.
+- **Retry deliberately.** Use `nack` with a delay for transient failures. Do
+  not acknowledge failed work; an unacknowledged delivery becomes available
+  again after its visibility timeout.
+- **Batch busy paths.** `publish_batch`, `ack_batch`, and `nack_batch` reduce
+  SQLite commits. Keep batches at or below `Config::max_batch_size` (500 by
+  default).
+- **Treat receipts as single-attempt tokens.** A stale receipt safely returns
+  `false`; it cannot acknowledge a newer delivery attempt.
+- **Keep work outside database transactions.** Poll, process, then acknowledge.
+  Never hold an application transaction open while doing slow network work.
+- **Prune periodically.** Call `prune_messages` with an age cutoff and bounded
+  batch size to remove old messages no consumer still needs.
+
+Dropping a worker handle is enough for a normal shutdown. Use
+`begin_draining()` only when permanently retiring a consumer: draining is
+irreversible, stops future fan-out, and leaves existing work available to
+finish.
+
+## Operational notes
+
+The database file is the durability boundary. WAL mode and the default config
+are suitable starting points for most applications. Use `snapshot()` for
+health and backlog reporting, and avoid modifying `litefan_*` tables directly.
+Message bodies are bytes; serialization and schema versioning belong to the
+application.
+
+See [DESIGN.md](DESIGN.md) for delivery invariants, retention behavior, and the
+SQLite storage model.
+
+Run the quality gate with:
 
 ```sh
 cargo test --all-targets
